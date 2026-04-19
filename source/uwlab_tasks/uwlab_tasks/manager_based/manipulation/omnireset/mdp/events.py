@@ -14,6 +14,7 @@ import torch
 import trimesh
 import trimesh.transformations as tra
 from collections.abc import Sequence
+import matplotlib.pyplot as plt
 
 import carb
 import isaaclab.sim as sim_utils
@@ -34,6 +35,67 @@ from uwlab_tasks.manager_based.manipulation.omnireset.mdp import utils
 
 from ..assembly_keypoints import Offset
 from .success_monitor_cfg import SuccessMonitorCfg
+
+
+
+
+def visualize_tensor_distribution(data, output_filename="distribution.png"):
+    """
+    Visualizes a (N, 2) torch Tensor using a 2D hexbin plot.
+    
+    Args:
+        data (torch.Tensor): Tensor of shape (N, 2)
+        output_filename (str): Path to save the resulting image.
+    """
+    # Ensure data is on CPU and converted to numpy for plotting
+    if data.is_cuda:
+        data = data.cpu()
+    
+    # Detach from graph if necessary and convert to numpy
+    points = data.detach().numpy()
+    x = points[:, 0]
+    y = points[:, 1]
+
+    plt.figure(figsize=(10, 8))
+    
+    # 'gridsize' controls the resolution of the bins. 
+    # 'cmap' defines the color palette (Magma/Viridis are great for density).
+    hb = plt.hexbin(x, y, gridsize=50, cmap='magma', bins='log')
+    
+    plt.colorbar(hb, label='Log10(count + 1)')
+    plt.xlabel('Dimension 1')
+    plt.ylabel('Dimension 2')
+    plt.title(f'2D Distribution Density (N={data.shape[0]})')
+    
+    # Clean up layout and save
+    plt.tight_layout()
+    plt.savefig(output_filename, dpi=300)
+    plt.close()
+    print(f"Visualization saved to {output_filename}")
+
+
+def save_point_distribution_image(x, out_path="dist.png", bins=400, dpi=200, fixed_bounds=False):
+    """
+    x: torch.Tensor, shape (N, 2) on CPU or GPU
+    Saves a 2D histogram (density map) visualization to out_path.
+    """
+    if isinstance(x, torch.Tensor):
+        x = x.detach()
+        if x.is_cuda:
+            x = x.cpu()
+        x = x.float().numpy()
+
+    fig, ax = plt.subplots()
+    if not fixed_bounds:
+        ax.hist2d(x[:, 0], x[:, 1], bins=bins)
+    else:
+        ax.hist2d(x[:, 0], x[:, 1], bins=bins, range=[[0.25, 0.6], [-0.15, 0.55]])
+    ax.set_xlabel("x"); ax.set_ylabel("y"); ax.set_title("2D point distribution")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=dpi)
+    plt.close(fig)
+    print(f"Saved to: {out_path}")
+
 
 
 class grasp_sampling_event(ManagerTermBase):
@@ -999,6 +1061,7 @@ class MultiResetManager(ManagerTermBase):
         dataset_dir: str = cfg.params.get("dataset_dir", "")
         reset_types: list[str] = cfg.params.get("reset_types", [])
         probabilities: list[float] = cfg.params.get("probs", [])
+        reset_mode: str = cfg.params.get("reset_mode", "none")
 
         if not reset_types:
             raise ValueError("No reset_types provided")
@@ -1026,8 +1089,60 @@ class MultiResetManager(ManagerTermBase):
                 raise FileNotFoundError(f"Dataset file {dataset_file} could not be accessed or downloaded.")
 
             dataset = torch.load(local_file_path)
-            num_states.append(len(dataset["initial_state"]["articulation"]["robot"]["joint_position"]))
-            init_indices = torch.arange(num_states[-1], device=env.device)
+
+
+            all_insertive_poses = torch.stack(dataset['initial_state']['rigid_object']['insertive_object']['root_pose'], dim=0)
+            all_receptive_poses = torch.stack(dataset['initial_state']['rigid_object']['receptive_object']['root_pose'], dim=0)
+            all_insertive_xs = torch.floor(all_insertive_poses[:, 0] / 0.05 - 6).to(dtype=torch.int64)
+            all_insertive_ys = torch.floor(all_insertive_poses[:, 1] / 0.05 + 2).to(dtype=torch.int64)
+            all_receptive_xs = torch.floor(all_receptive_poses[:, 0] / 0.05 - 6).to(dtype=torch.int64)
+            all_receptive_ys = torch.floor(all_receptive_poses[:, 1] / 0.05 + 2).to(dtype=torch.int64)
+            init_indices_mask = (all_insertive_poses[:, 0] > 0.3) & (all_insertive_poses[:, 0] < 0.55) & (all_insertive_poses[:, 1] > -0.1) & (all_insertive_poses[:, 1] < 0.5)
+            init_indices_mask &= (all_receptive_poses[:, 0] > 0.3) & (all_receptive_poses[:, 0] < 0.55) & (all_receptive_poses[:, 1] > -0.1) & (all_receptive_poses[:, 1] < 0.5)
+            if reset_mode == "xleq035":
+                init_indices_mask &= (all_insertive_poses[:, 0] < 0.35) & (all_receptive_poses[:, 0] < 0.35)
+            elif reset_mode == "recxgeq05":
+                init_indices_mask &= (all_receptive_poses[:, 0] > 0.5)
+            elif reset_mode == "none":
+                pass
+            elif reset_mode == "y2_id":
+                init_indices_mask &= (all_insertive_ys % 2 == 0) & (all_receptive_ys % 2 == 0)
+            elif reset_mode == "y2_ood":
+                init_indices_mask &= (all_insertive_ys % 2 != 0) | (all_receptive_ys % 2 != 0)
+            elif reset_mode == "y3_id":
+                init_indices_mask &= (all_insertive_ys % 3 == 1) & (all_receptive_ys % 3 == 0)
+            elif reset_mode == "y3_ood":
+                init_indices_mask &= (all_insertive_ys % 3 != 1) | (all_receptive_ys % 3 != 0)
+            elif reset_mode == "y4_id":
+                init_indices_mask &= (all_insertive_ys % 4 == 1) & (all_receptive_ys % 4 == 1)
+            elif reset_mode == "y4_ood":
+                init_indices_mask &= (all_insertive_ys % 4 != 1) | (all_receptive_ys % 4 != 1)
+            elif reset_mode == "y5_id":
+                init_indices_mask &= (all_insertive_ys % 5 == 1) & (all_receptive_ys % 5 == 1)
+            elif reset_mode == "y5_ood":
+                init_indices_mask &= (all_insertive_ys % 5 != 1) | (all_receptive_ys % 5 != 1)
+            elif reset_mode == "r3_id":
+                init_indices_mask &= (all_receptive_xs % 3 == 0) & (all_receptive_ys % 3 == 0)
+            elif reset_mode == "r3_ood":
+                init_indices_mask &= (all_receptive_xs % 3 != 0) | (all_receptive_ys % 3 != 0)
+            elif reset_mode == "r4_id":
+                init_indices_mask &= (all_receptive_xs % 4 == 0) & (all_receptive_ys % 4 == 1)
+            elif reset_mode == "r4_ood":
+                init_indices_mask &= (all_receptive_xs % 4 != 0) | (all_receptive_ys % 4 != 1)
+            elif reset_mode == "breakpoint":
+                breakpoint()
+            elif reset_mode.startswith("i") and reset_mode[1:].isdigit():
+                i = int(reset_mode[1:])
+                i = torch.nonzero(init_indices_mask).squeeze(-1)[i]
+                init_indices_mask = torch.arange(len(init_indices_mask)) == i
+            else:
+                raise NotImplementedError(f"Unsupported reset_mode: {reset_mode}")
+            init_indices = torch.nonzero(init_indices_mask).squeeze(-1).to(device=env.device)
+            save_point_distribution_image(all_insertive_poses[init_indices], "viz/insertive_distribution.png", fixed_bounds=True)
+            save_point_distribution_image(all_receptive_poses[init_indices], "viz/receptive_distribution.png", fixed_bounds=True)
+
+            print(f"For dataset {dataset_file}, loaded {len(init_indices)}/{len(dataset['initial_state']['rigid_object']['insertive_object']['root_pose'])} reset states!!!")
+            num_states.append(len(init_indices))
             self.datasets.append(sample_state_data_set(dataset, init_indices, env.device))
 
         # Normalize probabilities and store dataset lengths
@@ -1052,6 +1167,7 @@ class MultiResetManager(ManagerTermBase):
         reset_types: list[str],
         probs: list[float],
         success: str | None = None,
+        reset_mode: str = 'none',
     ) -> None:
         if env_ids is None:
             env_ids = torch.arange(self.num_envs, device=self._env.device)

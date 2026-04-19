@@ -71,3 +71,8 @@ tests/
 
 # Docker history
 .uw-lab-docker-history
+
+1.4.341.1/*
+docker/
+.codex
+expert_policies/

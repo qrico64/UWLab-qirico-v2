@@ -20,6 +20,7 @@ from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
+from isaaclab.sensors import TiledCamera, TiledCameraCfg, save_images_to_file
 
 from uwlab_assets import UWLAB_CLOUD_ASSETS_DIR
 from uwlab_assets.robots.ur5e_robotiq_gripper import EXPLICIT_UR5E_ROBOTIQ_2F85, IMPLICIT_UR5E_ROBOTIQ_2F85
@@ -102,6 +103,22 @@ class RlStateSceneCfg(InteractiveSceneCfg):
             texture_file=f"{ISAAC_NUCLEUS_DIR}/Materials/Textures/Skies/PolyHaven/kloofendal_43d_clear_puresky_4k.hdr",
         ),
     )
+
+    # side_camera = TiledCameraCfg(
+    #     prim_path="{ENV_REGEX_NS}/Robot/rgb_side_camera",
+    #     update_period=0,
+    #     height=224,
+    #     width=224,
+    #     offset=TiledCameraCfg.OffsetCfg(
+    #         pos=(1.65, 0, 0.15),
+    #         rot=(0.5, 0.5, 0.5, 0.5), # (w, x, y, z), -z direction.
+    #         convention="opengl",
+    #     ),
+    #     data_types=["rgb"],
+    #     spawn=sim_utils.PinholeCameraCfg(
+    #         focal_length=21.9
+    #     )
+    # )
 
 
 @configclass
@@ -514,9 +531,74 @@ class ObservationsCfg:
             self.concatenate_terms = True
             self.history_length = 1
 
+    @configclass
+    class PolicyCfg2(PolicyCfg):
+        def __post_init__(self):
+            self.enable_corruption = True
+            self.concatenate_terms = True
+            self.history_length = 1
+
+    @configclass
+    class PolicyCfg3(PolicyCfg2):
+        def __post_init__(self):
+            self.enable_corruption = False
+            self.concatenate_terms = False
+            self.history_length = 1
+
+    @configclass
+    class PolicyCfg_AAAAAA(ObsGroup):
+        insertive_asset_pose = ObsTerm(
+            func=task_mdp.target_asset_pose_in_root_asset_frame,
+            params={
+                "target_asset_cfg": SceneEntityCfg("insertive_object"),
+                "root_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+                "rotation_repr": "axis_angle",
+            },
+        )
+
+        receptive_asset_pose = ObsTerm(
+            func=task_mdp.target_asset_pose_in_root_asset_frame,
+            params={
+                "target_asset_cfg": SceneEntityCfg("receptive_object"),
+                "root_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+                "rotation_repr": "axis_angle",
+            },
+        )
+
+        insertive_asset_in_receptive_asset_frame: ObsTerm = ObsTerm(
+            func=task_mdp.target_asset_pose_in_root_asset_frame,
+            params={
+                "target_asset_cfg": SceneEntityCfg("insertive_object"),
+                "root_asset_cfg": SceneEntityCfg("receptive_object"),
+                "rotation_repr": "axis_angle",
+            },
+        )
+
+        def __post_init__(self):
+            self.enable_corruption = True
+            self.concatenate_terms = False
+            self.history_length = 5
+
+    @configclass
+    class RGBCfg(ObsGroup):        
+        side_rgb = ObsTerm(
+            func=task_mdp.process_image,
+            params={
+                "sensor_cfg": SceneEntityCfg("side_camera"),
+                "data_type": "rgb",
+                "process_image": True,
+                "output_size": (224, 224)
+            },
+        )
+
+
     # observation groups
     policy: PolicyCfg = PolicyCfg()
     critic: CriticCfg = CriticCfg()
+    policy2: PolicyCfg2 = PolicyCfg2()
+    policy_aaaaaa: PolicyCfg_AAAAAA = PolicyCfg_AAAAAA()
+    # policy3: PolicyCfg3 = PolicyCfg3()
+    # rgb: RGBCfg = RGBCfg()
 
 
 @configclass
