@@ -31,6 +31,14 @@ In addition to what IsaacLab provides, UW Lab brings:
 
 Follow the [installation guide](https://uw-lab.github.io/UWLab/main/source/setup/installation/index.html).
 
+## Installation on Hyak
+1. `apptainer pull uw-lab-2_latest.sif docker://rico64/uw-lab-1:latest`
+2. `mkdir -p _isaaclab`
+3. `git clone https://github.com/isaac-sim/IsaacLab.git _isaaclab/IsaacLab`
+4. Enter the apptainer with `utils/enter.sh`
+5. In the apptainer, do `./_isaaclab/IsaacLab/isaaclab.sh --install`
+6. In the apptainer, try `/isaac-sim/python.sh -c "from isaaclab.app import AppLauncher"`; If this works, then isaacsim is set up.
+
 
 ## Getting Started
 
