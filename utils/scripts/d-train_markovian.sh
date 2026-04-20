@@ -7,10 +7,10 @@ source a.sh
 python scripts/reinforcement_learning/rsl_rl/train_markovian.py \
   --train-data collected_data/data_a2r2o0015n100_1/trajectories.pkl \
   --test-data collected_data/data_a2r2o0015n100_2/trajectories.pkl \
-  --obs-key policy \
-  --output-dir experiments/apr20/markovian_policy \
+  --obs-key policy2 \
+  --output-dir experiments/apr20/markovian_a2r2o0015_policy2_ntrain100_priviledged \
   --experiment-name markovian_policy \
-  --run-name "apr20-markovian_policy" \
+  --run-name "apr20-markovian_a2r2o0015_policy2_ntrain100_priviledged" \
   --wandb-mode online \
   --seed 42 \
   --epochs 100 \
@@ -20,6 +20,8 @@ python scripts/reinforcement_learning/rsl_rl/train_markovian.py \
   --hidden-dim 512 \
   --dropout 0.3 \
   --train-fraction 0.8 \
+  --with_noise_value true \
+  --num_train_scenarios 100 \
   --num-workers 4 \
   --device cuda \
   --save-every 10

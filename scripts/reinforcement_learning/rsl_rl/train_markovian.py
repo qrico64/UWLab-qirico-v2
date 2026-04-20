@@ -37,7 +37,10 @@ class DatasetBundle:
     dataset_path: str
     num_total_trajectories: int
     num_kept_trajectories: int
-    num_filtered_trajectories: int
+    num_action_filtered_trajectories: int
+    num_scenario_filtered_trajectories: int
+    num_used_transitions: int
+    applied_num_train_scenarios: int | None
 
 
 class TensorDataset(Dataset):
@@ -114,10 +117,43 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hidden-dim", type=int, default=512, help="Hidden dimension for each MLP layer.")
     parser.add_argument("--dropout", type=float, default=0.3, help="Dropout probability.")
     parser.add_argument("--train-fraction", type=float, default=0.8, help="Fraction of transitions used for training.")
+    parser.add_argument(
+        "--with_noise_value",
+        "--with-noise-value",
+        type=parse_bool,
+        nargs="?",
+        const=True,
+        default=False,
+        help="If true, append per-trajectory obs_noise and act_noise values to each transition input.",
+    )
+    parser.add_argument(
+        "--num_train_scenarios",
+        "--num-train-scenarios",
+        type=parse_optional_int,
+        default=None,
+        help="If set, keep only train/val trajectories with noise_index in [0, N-1] before splitting.",
+    )
     parser.add_argument("--num-workers", type=int, default=4, help="DataLoader worker count.")
     parser.add_argument("--device", type=str, default="cuda", help="Training device, e.g. cuda or cpu.")
     parser.add_argument("--save-every", type=int, default=10, help="Save the latest checkpoint every N epochs.")
     return parser.parse_args()
+
+
+def parse_optional_int(value: str) -> int | None:
+    if value.lower() in {"none", "null", ""}:
+        return None
+    return int(value)
+
+
+def parse_bool(value: str | bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    lowered = value.lower()
+    if lowered in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if lowered in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
 
 
 def set_seed(seed: int) -> None:
@@ -145,23 +181,47 @@ def trajectory_has_large_action(trajectory: dict, threshold: float = 100.0) -> b
     return bool(np.any(action_magnitudes > threshold))
 
 
-def load_transitions(path: str, obs_key: str) -> DatasetBundle:
+def trajectory_in_train_scenarios(trajectory: dict, num_train_scenarios: int | None) -> bool:
+    if num_train_scenarios is None:
+        return True
+    noise_index = trajectory.get("noise_index")
+    if noise_index is None:
+        return False
+    return 0 <= int(noise_index) < num_train_scenarios
+
+
+def load_transitions(
+    path: str,
+    obs_key: str,
+    num_train_scenarios: int | None = None,
+    with_noise_value: bool = False,
+) -> DatasetBundle:
     with open(path, "rb") as f:
         trajectories = pickle.load(f)
 
     dataset_info = load_dataset_info(path)
     obs_list = []
     target_list = []
-    num_filtered_trajectories = 0
+    num_action_filtered_trajectories = 0
+    num_scenario_filtered_trajectories = 0
     for trajectory in trajectories:
         if trajectory_has_large_action(trajectory):
-            num_filtered_trajectories += 1
+            num_action_filtered_trajectories += 1
+            continue
+
+        if not trajectory_in_train_scenarios(trajectory, num_train_scenarios):
+            num_scenario_filtered_trajectories += 1
             continue
 
         observations = np.asarray(trajectory["obs"][obs_key], dtype=np.float32)
         actions = np.asarray(trajectory["actions"], dtype=np.float32)
         rand_noise = np.asarray(trajectory["rand_noise"], dtype=np.float32)
         targets = actions - rand_noise
+        if with_noise_value:
+            obs_noise = np.asarray(trajectory["obs_noise"], dtype=np.float32).reshape(1, -1)
+            act_noise = np.asarray(trajectory["act_noise"], dtype=np.float32).reshape(1, -1)
+            noise_features = np.repeat(np.concatenate([obs_noise, act_noise], axis=-1), observations.shape[0], axis=0)
+            observations = np.concatenate([observations, noise_features], axis=-1)
 
         if observations.shape[0] != targets.shape[0]:
             raise ValueError(
@@ -181,8 +241,11 @@ def load_transitions(path: str, obs_key: str) -> DatasetBundle:
         info=dataset_info,
         dataset_path=path,
         num_total_trajectories=len(trajectories),
-        num_kept_trajectories=len(trajectories) - num_filtered_trajectories,
-        num_filtered_trajectories=num_filtered_trajectories,
+        num_kept_trajectories=len(trajectories) - num_action_filtered_trajectories - num_scenario_filtered_trajectories,
+        num_action_filtered_trajectories=num_action_filtered_trajectories,
+        num_scenario_filtered_trajectories=num_scenario_filtered_trajectories,
+        num_used_transitions=inputs.shape[0],
+        applied_num_train_scenarios=num_train_scenarios,
     )
 
 
@@ -272,6 +335,8 @@ def main() -> None:
     args.run_name = args.run_name or None
     if not 0.0 < args.train_fraction < 1.0:
         raise ValueError(f"--train-fraction must be between 0 and 1, got {args.train_fraction}")
+    if args.num_train_scenarios is not None and args.num_train_scenarios <= 0:
+        raise ValueError(f"--num-train-scenarios must be positive when set, got {args.num_train_scenarios}")
 
     set_seed(args.seed)
     os.makedirs(args.output_dir, exist_ok=True)
@@ -284,8 +349,17 @@ def main() -> None:
         raise RuntimeError("CUDA was requested but is not available.")
     device = requested_device
 
-    full_trainval_bundle = load_transitions(args.train_data, args.obs_key)
-    test_bundle = load_transitions(args.test_data, args.obs_key)
+    full_trainval_bundle = load_transitions(
+        args.train_data,
+        args.obs_key,
+        num_train_scenarios=args.num_train_scenarios,
+        with_noise_value=args.with_noise_value,
+    )
+    test_bundle = load_transitions(
+        args.test_data,
+        args.obs_key,
+        with_noise_value=args.with_noise_value,
+    )
     full_trainval = full_trainval_bundle.transitions
     test_data = test_bundle.transitions
 
@@ -338,6 +412,7 @@ def main() -> None:
         "optimizer": optimizer.__class__.__name__,
         "input_normalization": "train_split_mean_std",
         "target_normalization": "train_split_mean_std",
+        "with_noise_value": args.with_noise_value,
     }
     dataset_info = {
         "trainval": {
@@ -345,16 +420,20 @@ def main() -> None:
             "info": full_trainval_bundle.info,
             "num_total_trajectories": full_trainval_bundle.num_total_trajectories,
             "num_kept_trajectories": full_trainval_bundle.num_kept_trajectories,
-            "num_filtered_trajectories": full_trainval_bundle.num_filtered_trajectories,
-            "num_transitions": len(full_dataset),
+            "num_action_filtered_trajectories": full_trainval_bundle.num_action_filtered_trajectories,
+            "num_scenario_filtered_trajectories": full_trainval_bundle.num_scenario_filtered_trajectories,
+            "num_transitions": full_trainval_bundle.num_used_transitions,
+            "applied_num_train_scenarios": full_trainval_bundle.applied_num_train_scenarios,
         },
         "test": {
             "dataset_path": test_bundle.dataset_path,
             "info": test_bundle.info,
             "num_total_trajectories": test_bundle.num_total_trajectories,
             "num_kept_trajectories": test_bundle.num_kept_trajectories,
-            "num_filtered_trajectories": test_bundle.num_filtered_trajectories,
-            "num_transitions": len(test_dataset),
+            "num_action_filtered_trajectories": test_bundle.num_action_filtered_trajectories,
+            "num_scenario_filtered_trajectories": test_bundle.num_scenario_filtered_trajectories,
+            "num_transitions": test_bundle.num_used_transitions,
+            "applied_num_train_scenarios": test_bundle.applied_num_train_scenarios,
         },
         "split": {
             "train_fraction": args.train_fraction,
@@ -363,6 +442,14 @@ def main() -> None:
         },
         "filtering": {
             "action_magnitude_threshold": 100.0,
+            "num_train_scenarios": args.num_train_scenarios,
+            "with_noise_value": args.with_noise_value,
+        },
+        "dataset_sizes_used_for_training": {
+            "train_transitions": len(train_dataset),
+            "val_transitions": len(val_dataset),
+            "test_transitions": len(test_dataset),
+            "trainval_transitions_before_split": len(full_dataset),
         },
     }
     base_save_dict = {
@@ -382,8 +469,12 @@ def main() -> None:
             "train_transitions": len(train_dataset),
             "val_transitions": len(val_dataset),
             "test_transitions": len(test_dataset),
-            "trainval_filtered_trajectories": full_trainval_bundle.num_filtered_trajectories,
-            "test_filtered_trajectories": test_bundle.num_filtered_trajectories,
+            "num_train_scenarios": args.num_train_scenarios,
+            "with_noise_value": args.with_noise_value,
+            "trainval_action_filtered_trajectories": full_trainval_bundle.num_action_filtered_trajectories,
+            "trainval_scenario_filtered_trajectories": full_trainval_bundle.num_scenario_filtered_trajectories,
+            "test_action_filtered_trajectories": test_bundle.num_action_filtered_trajectories,
+            "test_scenario_filtered_trajectories": test_bundle.num_scenario_filtered_trajectories,
         },
     )
 
