@@ -653,6 +653,15 @@ class TerminationsCfg:
 
     abnormal_robot = DoneTerm(func=task_mdp.abnormal_robot_state)
 
+    early_success = DoneTerm(
+        func=task_mdp.early_success_termination, params={"num_consecutive_successes": 3, "min_episode_length": 10}
+    )
+
+    success = DoneTerm(
+        func=task_mdp.consecutive_success_state_with_min_length,
+        params={"num_consecutive_successes": 3, "min_episode_length": 10},
+    )
+
 
 @configclass
 class FinetuneCurriculumsCfg:
