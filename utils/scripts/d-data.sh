@@ -1,3 +1,18 @@
+#!/bin/bash -l
+#SBATCH --job-name=data        # Job name
+#SBATCH --output=collected_data/data_r2o0015n100_2/log/%j_%x_out.txt        # Output file (%j = job ID)
+#SBATCH --error=collected_data/data_r2o0015n100_2/log/%j_%x_err.txt         # Error file
+#SBATCH --time=24:00:00            # Time limit (hh:mm:ss)
+#SBATCH --nodes=1                  # Number of nodes
+#SBATCH --ntasks=1                 # Number of tasks (MPI ranks)
+#SBATCH --cpus-per-task=6          # CPUs per task
+#SBATCH --gres=gpu:a40:1               # GPUs per node (if needed)
+#SBATCH --mem=60G                  # Memory per node
+#SBATCH --partition=ckpt-all        # Partition (queue) name
+#SBATCH --account=weirdlab         # Slurm account/project name
+cd /mmfs1/gscratch/weirdlab/qirico/Meta-Learning-25-10-1/UWLab-qirico-v2
+source a.sh
+
 export UW_BASE=/mmfs1/gscratch/weirdlab/qirico/Meta-Learning-25-10-1/UWLab-qirico-v2/docker
 
 export APPTAINERENV_ISAACSIM_PATH=/isaac-sim/
@@ -33,13 +48,18 @@ apptainer exec --nv \
 
 HYDRA_FULL_ERROR=1 /isaac-sim/python.sh scripts/reinforcement_learning/rsl_rl/play_datacollect.py \
     --task OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Play-v0 \
-    --num_envs 20 \
+    --num_envs 2500 \
     --checkpoint expert_policies/peg_state_rl_expert_seed42.pt \
     env.scene.insertive_object=peg \
     env.scene.receptive_object=peghole \
     --headless \
-    --record_path collected_data/trajectories.pkl \
-    --num_trajectories 100 \
+    --record_path collected_data/data_r2o0015n100_2/trajectories.pkl \
+    --num_trajectories 50000 \
     --horizon 60 \
+    --act_noise_scale 0.0 \
+    --rand_noise_scale 2.0 \
+    --obs_receptive_noise_scale 0.015 \
+    --num_discrete_noises 100 \
+    --seed 43
 
 '

@@ -596,7 +596,7 @@ class ObservationsCfg:
     policy: PolicyCfg = PolicyCfg()
     critic: CriticCfg = CriticCfg()
     policy2: PolicyCfg2 = PolicyCfg2()
-    policy_aaaaaa: PolicyCfg_AAAAAA = PolicyCfg_AAAAAA()
+    # policy_aaaaaa: PolicyCfg_AAAAAA = PolicyCfg_AAAAAA()
     # policy3: PolicyCfg3 = PolicyCfg3()
     # rgb: RGBCfg = RGBCfg()
 

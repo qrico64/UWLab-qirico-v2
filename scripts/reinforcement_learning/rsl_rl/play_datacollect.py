@@ -39,6 +39,10 @@ parser.add_argument("--num_trajectories", type=int, default=10, help="Number of 
 parser.add_argument("--horizon", type=int, default=60, help="Horizon, max steps, duration, whatever you call it.")
 parser.add_argument("--reset_mode", type=str, default='none', help="Options: none, xleq035.")
 parser.add_argument("--sim_device", type=str, default="cuda:0", help="Device to run the simulation on.")
+parser.add_argument("--act_noise_scale", type=float, default=0, help="Scale of action systematic noise.")
+parser.add_argument("--rand_noise_scale", type=float, default=0, help="Scale of action random noise.")
+parser.add_argument("--obs_receptive_noise_scale", type=float, default=0, help="Scale of receptive object in observation noise.")
+parser.add_argument("--num_discrete_noises", type=int, default=None, help="Number of discrete action/obs noise scenarios.")
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -91,9 +95,11 @@ import uwlab_tasks  # noqa: F401
 from isaaclab_tasks.utils import get_checkpoint_path
 from uwlab_tasks.utils.hydra import hydra_task_config
 
+import cur_utils
+
 # PLACEHOLDER: Extension template (do not remove this comment)
 
-RECORDED_OBS_GROUPS = ("policy", "policy2", "policy_aaaaaa")
+RECORDED_OBS_GROUPS = ("policy", "policy2")
 
 def save_video(frames, path, fps=30):
     """Saves a list of frames (numpy arrays) to a video file."""
@@ -142,6 +148,10 @@ def new_recording():
         'rewards': [],
         'dones': [],
         'actions_expert': [],
+        'rand_noise': [],
+        'obs_noise': None,
+        'act_noise': None,
+        'noise_index': None,
     }
 def reduce_recording(recording):
     return {
@@ -152,7 +162,19 @@ def reduce_recording(recording):
         'rewards': np.stack(recording['rewards'], axis=0),
         'dones': np.stack(recording['dones'], axis=0),
         'actions_expert': np.stack(recording['actions_expert'], axis=0),
+        'rand_noise': np.stack(recording['rand_noise'], axis=0),
+        'obs_noise': recording['obs_noise'],
+        'act_noise': recording['act_noise'],
+        'noise_index': recording['noise_index'],
     }
+
+
+def sample_randn(shape, rng, device):
+    return torch.tensor(rng.standard_normal(size=shape), dtype=torch.float32, device=device)
+
+
+def sample_randint(high, size, rng, device):
+    return torch.tensor(rng.integers(high, size=size), dtype=torch.long, device=device)
 
 
 
@@ -280,6 +302,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         'num_trajectories': args_cli.num_trajectories,
         'horizon': args_cli.horizon,
         'reset_mode': args_cli.reset_mode,
+        'act_noise_scale': args_cli.act_noise_scale,
+        'rand_noise_scale': args_cli.rand_noise_scale,
+        'obs_receptive_noise_scale': args_cli.obs_receptive_noise_scale,
+        'num_discrete_noises': args_cli.num_discrete_noises,
     }
 
     # reset environment
@@ -288,14 +314,33 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     completed_recordings = []
     save_interval = max(1, args_cli.num_trajectories // 10)
     last_saved_count = 0
+    GENERAL_NOISE_SCALES = torch.Tensor(cur_utils.GENERAL_NOISE_SCALES).to(device=args_cli.device)
+    noise_rng = np.random.default_rng(agent_cfg.seed)
+    if args_cli.num_discrete_noises is None:
+        obsnoise = sample_randn((env.num_envs, 2), noise_rng, args_cli.device)
+        actnoise = sample_randn((env.num_envs, 7), noise_rng, args_cli.device)
+        noise_index = None
+    else:
+        obsnoise_scenarios = sample_randn((args_cli.num_discrete_noises, 2), noise_rng, args_cli.device)
+        actnoise_scenarios = sample_randn((args_cli.num_discrete_noises, 7), noise_rng, args_cli.device)
+        noise_index = sample_randint(args_cli.num_discrete_noises, env.num_envs, noise_rng, args_cli.device)
+        obsnoise = obsnoise_scenarios[noise_index]
+        actnoise = actnoise_scenarios[noise_index]
     
     # simulate environment
     while simulation_app.is_running() and len(completed_recordings) < args_cli.num_trajectories:
         # run everything in inference mode
         with torch.inference_mode():
             step_obs = obs
+            expert_actions = policy(step_obs)
+
             # agent stepping
-            actions = policy(step_obs)
+            noised_obs = cur_utils.apply_obs_noise(obs, obsnoise * args_cli.obs_receptive_noise_scale)
+            actions = policy(noised_obs)
+            actions += actnoise * args_cli.act_noise_scale * GENERAL_NOISE_SCALES
+            randnoise = sample_randn((env.num_envs, 7), noise_rng, args_cli.device) * args_cli.rand_noise_scale * GENERAL_NOISE_SCALES
+            actions += randnoise
+
             # env stepping
             obs, rewards, dones, info = env.step(actions)
 
@@ -304,12 +349,23 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     current_recordings[i]['obs'][k].append(step_obs[k][i].cpu().numpy())
                     current_recordings[i]['next_obs'][k].append(obs[k][i].cpu().numpy())
                 current_recordings[i]['actions'].append(actions[i].cpu().numpy())
-                current_recordings[i]['actions_expert'].append(actions[i].cpu().numpy())
+                current_recordings[i]['actions_expert'].append(expert_actions[i].cpu().numpy())
                 current_recordings[i]['rewards'].append(rewards[i].cpu().numpy())
                 current_recordings[i]['dones'].append(dones[i].cpu().numpy())
+                current_recordings[i]['rand_noise'].append(randnoise[i].cpu().numpy())
                 if dones[i].item():
+                    current_recordings[i]['act_noise'] = actnoise[i].cpu().numpy()
+                    current_recordings[i]['obs_noise'] = obsnoise[i].cpu().numpy()
+                    current_recordings[i]['noise_index'] = None if noise_index is None else noise_index[i].cpu().item()
                     completed_recordings.append(reduce_recording(current_recordings[i]))
                     current_recordings[i] = new_recording()
+                    if noise_index is None:
+                        obsnoise[i] = sample_randn(2, noise_rng, args_cli.device)
+                        actnoise[i] = sample_randn(7, noise_rng, args_cli.device)
+                    else:
+                        noise_index[i] = sample_randint(args_cli.num_discrete_noises, (), noise_rng, args_cli.device)
+                        obsnoise[i] = obsnoise_scenarios[noise_index[i]]
+                        actnoise[i] = actnoise_scenarios[noise_index[i]]
 
             collected_count = min(len(completed_recordings), args_cli.num_trajectories)
             if collected_count >= last_saved_count + save_interval or collected_count == args_cli.num_trajectories:
