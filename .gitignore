@@ -80,3 +80,4 @@ policy.onnx
 policy.pt
 collected_data/
 scripts/reinforcement_learning/rsl_rl/previous_scripts/
+experiments/
