@@ -89,14 +89,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--test-data",
         type=str,
-        default="collected_data/data_a2r2o0015n100_2/trajectories.pkl",
-        help="Path to the held-out test dataset.",
+        default="",
+        help="Optional path to the held-out test dataset.",
     )
     parser.add_argument(
         "--obs-key",
         type=str,
         default="policy",
-        choices=("policy", "policy2"),
+        choices=("policy", "policy2", "policy_actiononly"),
         help="Observation group to map from.",
     )
     parser.add_argument("--output-dir", type=str, default="logs/rsl_rl/markovian", help="Directory for checkpoints.")
@@ -213,7 +213,11 @@ def load_transitions(
             num_scenario_filtered_trajectories += 1
             continue
 
-        observations = np.asarray(trajectory["obs"][obs_key], dtype=np.float32)
+        observations = np.asarray(
+            trajectory["obs"]["policy" if obs_key == "policy_actiononly" else obs_key], dtype=np.float32
+        )
+        if obs_key == "policy_actiononly":
+            observations = observations[:, 30:65]
         actions = np.asarray(trajectory["actions"], dtype=np.float32)
         rand_noise = np.asarray(trajectory["rand_noise"], dtype=np.float32)
         targets = actions - rand_noise
@@ -355,13 +359,14 @@ def main() -> None:
         num_train_scenarios=args.num_train_scenarios,
         with_noise_value=args.with_noise_value,
     )
-    test_bundle = load_transitions(
-        args.test_data,
-        args.obs_key,
-        with_noise_value=args.with_noise_value,
-    )
+    test_bundle = None
+    if args.test_data and Path(args.test_data).exists():
+        test_bundle = load_transitions(
+            args.test_data,
+            args.obs_key,
+            with_noise_value=args.with_noise_value,
+        )
     full_trainval = full_trainval_bundle.transitions
-    test_data = test_bundle.transitions
 
     full_dataset = TensorDataset(full_trainval.inputs, full_trainval.targets)
     num_train = math.floor(len(full_dataset) * args.train_fraction)
@@ -373,7 +378,7 @@ def main() -> None:
 
     split_generator = torch.Generator().manual_seed(args.seed)
     train_dataset, val_dataset = random_split(full_dataset, [num_train, num_val], generator=split_generator)
-    test_dataset = TensorDataset(test_data.inputs, test_data.targets)
+    test_dataset = TensorDataset(test_bundle.transitions.inputs, test_bundle.transitions.targets) if test_bundle else None
 
     train_indices = train_dataset.indices
     train_inputs = full_trainval.inputs[train_indices]
@@ -384,7 +389,11 @@ def main() -> None:
     train_loader = build_dataloader(train_dataset, args.batch_size, shuffle=True, num_workers=args.num_workers)
     train_eval_loader = build_dataloader(train_dataset, args.batch_size, shuffle=False, num_workers=args.num_workers)
     val_loader = build_dataloader(val_dataset, args.batch_size, shuffle=False, num_workers=args.num_workers)
-    test_loader = build_dataloader(test_dataset, args.batch_size, shuffle=False, num_workers=args.num_workers)
+    test_loader = (
+        build_dataloader(test_dataset, args.batch_size, shuffle=False, num_workers=args.num_workers)
+        if test_dataset is not None
+        else None
+    )
 
     input_dim = full_trainval.inputs.shape[1]
     output_dim = full_trainval.targets.shape[1]
@@ -425,7 +434,9 @@ def main() -> None:
             "num_transitions": full_trainval_bundle.num_used_transitions,
             "applied_num_train_scenarios": full_trainval_bundle.applied_num_train_scenarios,
         },
-        "test": {
+        "test": None
+        if test_bundle is None
+        else {
             "dataset_path": test_bundle.dataset_path,
             "info": test_bundle.info,
             "num_total_trajectories": test_bundle.num_total_trajectories,
@@ -448,7 +459,7 @@ def main() -> None:
         "dataset_sizes_used_for_training": {
             "train_transitions": len(train_dataset),
             "val_transitions": len(val_dataset),
-            "test_transitions": len(test_dataset),
+            "test_transitions": len(test_dataset) if test_dataset is not None else 0,
             "trainval_transitions_before_split": len(full_dataset),
         },
     }
@@ -468,13 +479,13 @@ def main() -> None:
             "output_dim": output_dim,
             "train_transitions": len(train_dataset),
             "val_transitions": len(val_dataset),
-            "test_transitions": len(test_dataset),
+            "test_transitions": len(test_dataset) if test_dataset is not None else 0,
             "num_train_scenarios": args.num_train_scenarios,
             "with_noise_value": args.with_noise_value,
             "trainval_action_filtered_trajectories": full_trainval_bundle.num_action_filtered_trajectories,
             "trainval_scenario_filtered_trajectories": full_trainval_bundle.num_scenario_filtered_trajectories,
-            "test_action_filtered_trajectories": test_bundle.num_action_filtered_trajectories,
-            "test_scenario_filtered_trajectories": test_bundle.num_scenario_filtered_trajectories,
+            "test_action_filtered_trajectories": test_bundle.num_action_filtered_trajectories if test_bundle else 0,
+            "test_scenario_filtered_trajectories": test_bundle.num_scenario_filtered_trajectories if test_bundle else 0,
         },
     )
 
@@ -508,24 +519,28 @@ def main() -> None:
             model, train_eval_loader, loss_fn, device, input_mean, input_std, target_mean, target_std
         )
         val_loss = evaluate(model, val_loader, loss_fn, device, input_mean, input_std, target_mean, target_std)
-        test_loss = evaluate(model, test_loader, loss_fn, device, input_mean, input_std, target_mean, target_std)
 
         metrics = {
             "epoch": epoch,
             "loss/train": train_loss,
             "loss/train_eval": train_eval_loss,
             "loss/val": val_loss,
-            "loss/test": test_loss,
             "lr": optimizer.param_groups[0]["lr"],
         }
+        test_loss = None
+        if test_loader is not None:
+            test_loss = evaluate(model, test_loader, loss_fn, device, input_mean, input_std, target_mean, target_std)
+            metrics["loss/test"] = test_loss
         wandb.log(metrics, step=epoch)
-        print(
+        message = (
             f"Epoch {epoch:04d} | "
             f"train_loss={train_loss:.6f} | "
             f"train_eval_loss={train_eval_loss:.6f} | "
-            f"val_loss={val_loss:.6f} | "
-            f"test_loss={test_loss:.6f}"
+            f"val_loss={val_loss:.6f}"
         )
+        if test_loss is not None:
+            message += f" | test_loss={test_loss:.6f}"
+        print(message)
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
