@@ -119,3 +119,78 @@ def save_histogram(x, filename, bins=100):
     plt.savefig(filename)
     print(filename)
     plt.close()
+
+
+def plot_success_grid(coords, success, bins=10, save_path=None, fixed_bounds=False):
+    coords = np.asarray(coords)
+    success = np.asarray(success).astype(float)
+
+    x, y = coords[:, 0], coords[:, 1]
+
+    xrange = (x.min(), x.max())
+    yrange = (y.min(), y.max())
+    if fixed_bounds:
+        xrange = (-0.15, 0.6)
+        yrange = (-0.15, 0.6)
+        bins = (15, 15)
+
+    counts, xedges, yedges = np.histogram2d(
+        x, y, bins=bins, range=[xrange, yrange]
+    )
+    sums, _, _ = np.histogram2d(
+        x, y, bins=bins, range=[xrange, yrange], weights=success
+    )
+
+    rate = np.divide(sums, counts, out=np.full_like(sums, np.nan), where=counts > 0)
+
+    fig, ax = plt.subplots()
+
+    cmap = plt.get_cmap("viridis")
+    norm = plt.Normalize(vmin=0, vmax=1)
+
+    im = ax.imshow(
+        rate.T,
+        origin="lower",
+        extent=[*xrange, *yrange],
+        aspect="auto",
+        vmin=0, vmax=1,
+        cmap=cmap,
+    )
+    fig.colorbar(im, ax=ax, label="Success rate")
+
+    # --- overlay per-cell text (skip empty / NaN cells) ---
+    xcenters = 0.5 * (xedges[:-1] + xedges[1:])
+    ycenters = 0.5 * (yedges[:-1] + yedges[1:])
+
+    # rate has shape (nx, ny) corresponding to x-bins then y-bins
+    nx, ny = rate.shape
+    for i in range(nx):
+        for j in range(ny):
+            val = rate[i, j]
+            if not np.isfinite(val):  # empty cell -> don't annotate
+                continue
+
+            # Determine text color based on background luminance
+            r, g, b, _ = cmap(norm(val))
+            luminance = 0.299 * r + 0.587 * g + 0.114 * b
+            txt_color = "black" if luminance > 0.6 else "white"
+
+            ax.text(
+                xcenters[i],
+                ycenters[j],
+                f"{val:.2f}",
+                ha="center",
+                va="center",
+                color=txt_color,
+                fontsize=7,
+            )
+
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_title(f"Grid Success Rate / {len(success)}")
+
+    if save_path is not None:
+        fig.savefig(save_path, dpi=200, bbox_inches="tight")
+        print(save_path)
+
+    plt.close(fig)

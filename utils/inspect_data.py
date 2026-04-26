@@ -7,6 +7,7 @@ from sklearn.manifold import TSNE
 from mpl_toolkits.mplot3d import Axes3D
 from pathlib import Path
 
+
 def format_array_3dec(x: np.ndarray) -> str:
     if isinstance(x, torch.Tensor):
         x = x.detach().cpu()
@@ -19,6 +20,38 @@ def format_array_3dec(x: np.ndarray) -> str:
             suppress_small=False
         )
     return str(x)
+
+
+def format_array_exact(name, x, dtype):
+    body = np.array2string(
+        np.asarray(x),
+        separator=", ",
+        max_line_width=160,
+        formatter={"float_kind": lambda value: repr(float(value))},
+    )
+    return f"{name} = np.array({body}, dtype={dtype})"
+
+
+def print_and_save_noise_values(trajs, filename: Path):
+    act_noise = np.asarray([traj["act_noise"] for traj in trajs], dtype=np.float32)
+    obs_noise = np.asarray([traj["obs_noise"] for traj in trajs], dtype=np.float32)
+    noise_index = np.asarray([traj["noise_index"] for traj in trajs], dtype=np.int64)
+    scenario_ids = np.unique(noise_index)
+
+    act_noise = np.stack([act_noise[noise_index == i][0] for i in scenario_ids])
+    obs_noise = np.stack([obs_noise[noise_index == i][0] for i in scenario_ids])
+
+    lines = [
+        format_array_exact("noise_index", scenario_ids, "np.int64"),
+        format_array_exact("act_noise", act_noise, "np.float32"),
+        format_array_exact("obs_noise", obs_noise, "np.float32"),
+    ]
+    print("\n".join(lines))
+
+    output_path = filename.parent / "noise_values.txt"
+    with open(output_path, "w") as fo:
+        fo.write("\n\n".join(lines) + "\n")
+    print(f"Saved noise values to {output_path}")
 
 
 def save_point_distribution_image(x, out_path="dist.png", bins=400, dpi=200, fixed_bounds=False):
@@ -125,12 +158,13 @@ def plot_actions_tsne(actions, n_components=2, filename="tsne_plot.png"):
 
 
 def main():
-    FILENAME = "collected_data/data_a2r2o0015n100_2/trajectories.pkl"
+    FILENAME = "collected_data/data_apr25_a2r2o0015n20_1/trajectories.pkl"
     FILENAME = Path(FILENAME)
     VIZ_DIR = FILENAME.parent / "viz"
     VIZ_DIR.mkdir(exist_ok=True, parents=True)
     with open(FILENAME, "rb") as fi:
         trajs = pickle.load(fi)
+    print_and_save_noise_values(trajs, FILENAME)
     lengths = [traj['actions'].shape[0] for traj in trajs]
     save_histogram(lengths, VIZ_DIR / "lengths.png", bins=40)
     # receptive_starting_positions = np.stack([traj['starting_position']['receptive_position'][:2] for traj in trajs], axis=0)

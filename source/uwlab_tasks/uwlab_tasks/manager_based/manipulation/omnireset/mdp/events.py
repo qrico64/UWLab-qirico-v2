@@ -1103,6 +1103,10 @@ class MultiResetManager(ManagerTermBase):
                 init_indices_mask &= (all_insertive_poses[:, 0] < 0.35) & (all_receptive_poses[:, 0] < 0.35)
             elif reset_mode == "recxgeq05":
                 init_indices_mask &= (all_receptive_poses[:, 0] > 0.5)
+            elif reset_mode == "xleq035_recyleq005":
+                init_indices_mask &= (all_insertive_poses[:, 0] < 0.35) & (all_receptive_poses[:, 0] < 0.35) & (all_receptive_poses[:, 1] < 0.05)
+            elif reset_mode == "recxgeq05_recygeq015":
+                init_indices_mask &= (all_receptive_poses[:, 0] > 0.5) & (all_receptive_poses[:, 1] > 0.15)
             elif reset_mode == "none":
                 pass
             elif reset_mode == "y2_id":
