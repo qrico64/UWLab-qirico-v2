@@ -12,6 +12,7 @@ from typing import Any
 import matplotlib.pyplot as plt
 import numpy as np
 from sklearn.manifold import TSNE
+from sklearn.neighbors import NearestNeighbors
 
 
 @dataclass(frozen=True)
@@ -199,6 +200,106 @@ def standardize_combined(rows_a: np.ndarray, rows_b: np.ndarray) -> tuple[np.nda
     return (rows_a - mean) / std, (rows_b - mean) / std
 
 
+def nearest_neighbor_coverage_diagnostic(
+    scaled_a: np.ndarray,
+    scaled_b: np.ndarray,
+    *,
+    labels: tuple[str, str],
+    output_path: Path,
+    k: int = 10,
+    dpi: int = 300,
+) -> None:
+    # B -> A distances: how far each B point is from the A distribution
+    nn_a = NearestNeighbors(n_neighbors=k, algorithm="auto")
+    nn_a.fit(scaled_a)
+
+    b_to_a_distances, _ = nn_a.kneighbors(scaled_b)
+    b_to_a_d1 = b_to_a_distances[:, 0]
+    b_to_a_dk_mean = b_to_a_distances.mean(axis=1)
+
+    # A -> A leave-one-out distances: normal within-A nearest-neighbor scale
+    # Need k + 1 because each A point's closest neighbor is itself.
+    nn_a_self = NearestNeighbors(n_neighbors=k + 1, algorithm="auto")
+    nn_a_self.fit(scaled_a)
+
+    a_to_a_distances, _ = nn_a_self.kneighbors(scaled_a)
+    a_to_a_d1 = a_to_a_distances[:, 1]          # skip self
+    a_to_a_dk_mean = a_to_a_distances[:, 1:].mean(axis=1)
+
+    # Quantile-based coverage score.
+    # Example: a B point is "covered" if its nearest-A distance is within
+    # the 95th percentile of normal A-to-A nearest-neighbor distances.
+    threshold_d1 = np.quantile(a_to_a_d1, 0.99)
+    threshold_dk = np.quantile(a_to_a_dk_mean, 0.99)
+
+    coverage_d1 = np.mean(b_to_a_d1 <= threshold_d1)
+    coverage_dk = np.mean(b_to_a_dk_mean <= threshold_dk)
+
+    print(f"Nearest-neighbor coverage diagnostic: {labels[1]} against {labels[0]}")
+    print(f"  A->A d1 95th percentile: {threshold_d1:.4f}")
+    print(f"  B->A d1 covered fraction: {coverage_d1:.4f}")
+    print(f"  A->A mean-k 95th percentile: {threshold_dk:.4f}")
+    print(f"  B->A mean-k covered fraction: {coverage_dk:.4f}")
+
+    # Clip plot x-axis to the lower 95% of distances so rare outliers do not blow up the scale.
+    d1_xmax = np.quantile(np.concatenate([a_to_a_d1, b_to_a_d1]), 0.99)
+    dk_xmax = np.quantile(np.concatenate([a_to_a_dk_mean, b_to_a_dk_mean]), 0.99)
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5), constrained_layout=True)
+
+    axes[0].hist(
+        a_to_a_d1,
+        bins=80,
+        range=(0, d1_xmax),
+        alpha=0.6,
+        density=True,
+        label=f"{labels[0]} -> {labels[0]} leave-one-out",
+    )
+    axes[0].hist(
+        b_to_a_d1,
+        bins=80,
+        range=(0, d1_xmax),
+        alpha=0.6,
+        density=True,
+        label=f"{labels[1]} -> {labels[0]}",
+    )
+    axes[0].axvline(threshold_d1, linestyle="--", linewidth=1)
+    axes[0].set_xlim(0, d1_xmax)
+    axes[0].set_title("Nearest-neighbor distance")
+    axes[0].set_xlabel("distance")
+    axes[0].set_ylabel("density")
+    axes[0].legend()
+
+    axes[1].hist(
+        a_to_a_dk_mean,
+        bins=80,
+        range=(0, dk_xmax),
+        alpha=0.6,
+        density=True,
+        label=f"{labels[0]} -> {labels[0]} leave-one-out",
+    )
+    axes[1].hist(
+        b_to_a_dk_mean,
+        bins=80,
+        range=(0, dk_xmax),
+        alpha=0.6,
+        density=True,
+        label=f"{labels[1]} -> {labels[0]}",
+    )
+    axes[1].axvline(threshold_dk, linestyle="--", linewidth=1)
+    axes[1].set_xlim(0, dk_xmax)
+    axes[1].set_title(f"Mean distance to {k} nearest neighbors")
+    axes[1].set_xlabel("mean distance")
+    axes[1].set_ylabel("density")
+    axes[1].legend()
+
+    nn_output_path = output_path.with_name(f"{output_path.stem}_nn_coverage{output_path.suffix}")
+    fig.savefig(nn_output_path, dpi=dpi)
+    plt.close(fig)
+
+    print(f"Saved nearest-neighbor coverage plot to {nn_output_path}")
+
+
 def make_hist_plot(
     embedding_a: np.ndarray,
     embedding_b: np.ndarray,
@@ -297,6 +398,14 @@ def plot_series(
     )
 
     scaled_a, scaled_b = standardize_combined(rows_a, rows_b)
+    nearest_neighbor_coverage_diagnostic(
+        scaled_a,
+        scaled_b,
+        labels=labels,
+        output_path=output_path,
+        k=10,
+        dpi=dpi,
+    )
     combined = np.concatenate([scaled_a, scaled_b], axis=0)
     if combined.shape[0] <= 1:
         raise ValueError(f"Need at least two sampled valid {spec.name} rows to run t-SNE.")
