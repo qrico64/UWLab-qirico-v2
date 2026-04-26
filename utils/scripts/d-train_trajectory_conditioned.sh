@@ -5,12 +5,13 @@ cd /mmfs1/gscratch/weirdlab/qirico/Meta-Learning-25-10-1/UWLab-qirico-v2
 source a.sh
 
 python scripts/reinforcement_learning/rsl_rl/train_trajectory_conditioned.py \
-  --train-data collected_data/data_a2r2o0015n20_3/trajectories.pkl \
-  --test-data collected_data/data_a2r2o0015n100_2/trajectories.pkl \
-  --obs-key policy \
-  --output-dir experiments/apr20/transformer_a2r2o0015_policy_ntrain10_moredata \
+  --train-data collected_data/data_apr25_a2r2o0015n20_1/trajectories.pkl \
+  --test-data collected_data/data_apr25_a2r2o0015n100_2/trajectories.pkl \
+  --state-obs-key policy \
+  --traj-obs-key policy2 \
+  --output-dir experiments/apr25/transformer_a2r2o0015_policy_n10 \
   --experiment-name markovian_policy \
-  --run-name "apr20-transformer_a2r2o0015_policy_ntrain10_moredata" \
+  --run-name "apr25-transformer_a2r2o0015_policy_n10" \
   --wandb-mode online \
   --seed 42 \
   --epochs 80 \

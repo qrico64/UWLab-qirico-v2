@@ -1,22 +1,37 @@
 #!/usr/bin/env python3
-"""Plot 2D t-SNE histograms for two robot action datasets."""
+"""Plot 2D t-SNE histograms for two robot action and observation datasets."""
 
 from __future__ import annotations
 
 import argparse
 import pickle
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import matplotlib.pyplot as plt
 import numpy as np
 from sklearn.manifold import TSNE
 
 
+@dataclass(frozen=True)
+class SeriesSpec:
+    """Description of one per-timestep trajectory array to sample and plot."""
+
+    name: str
+    key_path: tuple[str, ...]
+    output_suffix: str
+    expected_dim: int | None = None
+    magnitude_threshold: float | None = None
+    abs_threshold: float | None = None
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Load two trajectory pickle files, sample valid actions_expert vectors, "
-            "embed them in 2D with t-SNE, and save overlaid 2D histograms."
+            "Load two trajectory pickle files, sample valid per-timestep action and "
+            "observation vectors, embed them in 2D with t-SNE, and save overlaid "
+            "2D histograms."
         )
     )
     parser.add_argument("dataset_a", type=Path, help="First trajectories.pkl file.")
@@ -32,13 +47,16 @@ def parse_args() -> argparse.Namespace:
         "--output",
         type=Path,
         default=Path("action_tsne_hist.png"),
-        help="Path for the output image.",
+        help=(
+            "Path for the action output image. Observation plots are saved beside it "
+            "with obs-key suffixes."
+        ),
     )
     parser.add_argument(
         "--max-samples-per-dataset",
         type=int,
         default=10_000,
-        help="Maximum number of valid actions to sample from each dataset before t-SNE.",
+        help="Maximum number of valid rows to sample from each dataset before t-SNE.",
     )
     parser.add_argument(
         "--bins",
@@ -53,6 +71,21 @@ def parse_args() -> argparse.Namespace:
         help="Drop actions whose L2 magnitude is greater than this threshold.",
     )
     parser.add_argument(
+        "--obs-keys",
+        nargs="+",
+        default=("policy", "policy2"),
+        help="Observation keys under traj['obs'] to plot.",
+    )
+    parser.add_argument(
+        "--observation-abs-threshold",
+        type=float,
+        default=300.0,
+        help=(
+            "Drop observations containing an absolute value greater than this threshold. "
+            "Use a negative value to disable this filter."
+        ),
+    )
+    parser.add_argument(
         "--perplexity",
         type=float,
         default=30.0,
@@ -63,78 +96,107 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def sample_valid_actions(
+def get_nested(mapping: dict[str, Any], key_path: tuple[str, ...]) -> Any:
+    """Read a nested trajectory value with a clear error if a key is absent."""
+    value: Any = mapping
+    traversed: list[str] = []
+    for key in key_path:
+        traversed.append(key)
+        if not isinstance(value, dict) or key not in value:
+            joined = "']['".join(traversed)
+            raise KeyError(f"Trajectory does not contain ['{joined}'].")
+        value = value[key]
+    return value
+
+
+def output_path_for_series(base_output: Path, spec: SeriesSpec) -> Path:
+    """Return the output path for a plot series without changing action output names."""
+    if not spec.output_suffix:
+        return base_output
+
+    suffix = base_output.suffix or ".png"
+    stem = base_output.stem if base_output.suffix else base_output.name
+    return base_output.with_name(f"{stem}_{spec.output_suffix}{suffix}")
+
+
+def sample_valid_rows(
     dataset_path: Path,
+    spec: SeriesSpec,
     *,
     max_samples: int,
-    magnitude_threshold: float,
     rng: np.random.Generator,
 ) -> tuple[np.ndarray, int, int]:
-    """Load a trajectory list and return a random sample of valid actions_expert rows."""
+    """Load trajectories and return a random sample of valid per-timestep rows."""
     if max_samples <= 0:
         raise ValueError("--max-samples-per-dataset must be positive.")
 
     with dataset_path.open("rb") as f:
         trajectories = pickle.load(f)
 
-    sampled_actions: np.ndarray | None = None
+    sampled_rows: np.ndarray | None = None
     sampled_keys: np.ndarray | None = None
-    total_actions = 0
-    total_valid_actions = 0
+    total_rows = 0
+    total_valid_rows = 0
 
     for traj_idx, trajectory in enumerate(trajectories):
-        if "actions_expert" not in trajectory:
-            raise KeyError(f"Trajectory {traj_idx} in {dataset_path} does not contain 'actions_expert'.")
-
-        actions = np.asarray(trajectory["actions_expert"])
-        if actions.ndim != 2 or actions.shape[1] != 7:
+        rows = np.asarray(get_nested(trajectory, spec.key_path))
+        if rows.ndim != 2:
             raise ValueError(
-                f"Expected actions_expert with shape (T, 7) in trajectory {traj_idx} of {dataset_path}, "
-                f"got {actions.shape}."
+                f"Expected {spec.name} with shape (T, D) in trajectory {traj_idx} of {dataset_path}, "
+                f"got {rows.shape}."
+            )
+        if spec.expected_dim is not None and rows.shape[1] != spec.expected_dim:
+            raise ValueError(
+                f"Expected {spec.name} with shape (T, {spec.expected_dim}) in trajectory {traj_idx} "
+                f"of {dataset_path}, got {rows.shape}."
             )
 
-        actions = actions.astype(np.float32, copy=False)
-        finite_mask = np.isfinite(actions).all(axis=1)
-        magnitude_mask = np.linalg.norm(actions, axis=1) <= magnitude_threshold
-        valid_actions = actions[finite_mask & magnitude_mask]
+        rows = rows.astype(np.float32, copy=False)
+        valid_mask = np.isfinite(rows).all(axis=1)
+        if spec.magnitude_threshold is not None:
+            valid_mask &= np.linalg.norm(rows, axis=1) <= spec.magnitude_threshold
+        if spec.abs_threshold is not None:
+            valid_mask &= (np.abs(rows) <= spec.abs_threshold).all(axis=1)
+        valid_rows = rows[valid_mask]
 
-        total_actions += actions.shape[0]
-        total_valid_actions += valid_actions.shape[0]
+        total_rows += rows.shape[0]
+        total_valid_rows += valid_rows.shape[0]
 
-        if not valid_actions.size:
+        if not valid_rows.size:
             continue
 
-        random_keys = rng.random(valid_actions.shape[0])
-        if valid_actions.shape[0] > max_samples:
+        random_keys = rng.random(valid_rows.shape[0])
+        if valid_rows.shape[0] > max_samples:
             keep = np.argpartition(random_keys, max_samples - 1)[:max_samples]
-            valid_actions = valid_actions[keep]
+            valid_rows = valid_rows[keep]
             random_keys = random_keys[keep]
 
-        if sampled_actions is None or sampled_keys is None:
-            sampled_actions = valid_actions.copy()
+        if sampled_rows is None or sampled_keys is None:
+            sampled_rows = valid_rows.copy()
             sampled_keys = random_keys.copy()
             continue
 
-        sampled_actions = np.concatenate([sampled_actions, valid_actions], axis=0)
+        sampled_rows = np.concatenate([sampled_rows, valid_rows], axis=0)
         sampled_keys = np.concatenate([sampled_keys, random_keys], axis=0)
-        if sampled_actions.shape[0] > max_samples:
+        if sampled_rows.shape[0] > max_samples:
             keep = np.argpartition(sampled_keys, max_samples - 1)[:max_samples]
-            sampled_actions = sampled_actions[keep]
+            sampled_rows = sampled_rows[keep]
             sampled_keys = sampled_keys[keep]
 
-    if sampled_actions is None:
-        raise ValueError(f"No valid actions found in {dataset_path}.")
+    if sampled_rows is None:
+        key_name = ".".join(spec.key_path)
+        raise ValueError(f"No valid {key_name} rows found in {dataset_path}.")
 
-    return sampled_actions, total_actions, total_valid_actions
+    return sampled_rows, total_rows, total_valid_rows
 
 
-def standardize_combined(actions_a: np.ndarray, actions_b: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Standardize both datasets using combined action statistics."""
-    combined = np.concatenate([actions_a, actions_b], axis=0)
+def standardize_combined(rows_a: np.ndarray, rows_b: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Standardize both datasets using combined feature statistics."""
+    combined = np.concatenate([rows_a, rows_b], axis=0)
     mean = combined.mean(axis=0)
     std = combined.std(axis=0)
     std = np.where(std < 1e-8, 1.0, std)
-    return (actions_a - mean) / std, (actions_b - mean) / std
+    return (rows_a - mean) / std, (rows_b - mean) / std
 
 
 def make_hist_plot(
@@ -206,35 +268,46 @@ def make_hist_plot(
     plt.close(fig)
 
 
-def main() -> None:
-    args = parse_args()
-    rng = np.random.default_rng(args.seed)
-
-    actions_a, total_a, valid_a = sample_valid_actions(
-        args.dataset_a,
-        max_samples=args.max_samples_per_dataset,
-        magnitude_threshold=args.magnitude_threshold,
+def plot_series(
+    dataset_a: Path,
+    dataset_b: Path,
+    spec: SeriesSpec,
+    *,
+    labels: tuple[str, str],
+    output_path: Path,
+    max_samples: int,
+    bins: int,
+    perplexity: float,
+    seed: int,
+    dpi: int,
+) -> None:
+    """Sample, embed, and plot one series from both datasets."""
+    rng = np.random.default_rng(seed)
+    rows_a, total_a, valid_a = sample_valid_rows(
+        dataset_a,
+        spec,
+        max_samples=max_samples,
         rng=rng,
     )
-    actions_b, total_b, valid_b = sample_valid_actions(
-        args.dataset_b,
-        max_samples=args.max_samples_per_dataset,
-        magnitude_threshold=args.magnitude_threshold,
+    rows_b, total_b, valid_b = sample_valid_rows(
+        dataset_b,
+        spec,
+        max_samples=max_samples,
         rng=rng,
     )
 
-    scaled_a, scaled_b = standardize_combined(actions_a, actions_b)
+    scaled_a, scaled_b = standardize_combined(rows_a, rows_b)
     combined = np.concatenate([scaled_a, scaled_b], axis=0)
     if combined.shape[0] <= 1:
-        raise ValueError("Need at least two sampled valid actions to run t-SNE.")
+        raise ValueError(f"Need at least two sampled valid {spec.name} rows to run t-SNE.")
 
-    perplexity = min(args.perplexity, max(1.0, (combined.shape[0] - 1) / 3.0))
+    effective_perplexity = min(perplexity, max(1.0, (combined.shape[0] - 1) / 3.0))
     tsne = TSNE(
         n_components=2,
-        perplexity=perplexity,
+        perplexity=effective_perplexity,
         init="pca",
         learning_rate="auto",
-        random_state=args.seed,
+        random_state=seed,
     )
     embedding = tsne.fit_transform(combined)
     embedding_a = embedding[: scaled_a.shape[0]]
@@ -243,15 +316,62 @@ def main() -> None:
     make_hist_plot(
         embedding_a,
         embedding_b,
-        labels=tuple(args.labels),
-        output_path=args.output,
-        bins=args.bins,
-        dpi=args.dpi,
+        labels=labels,
+        output_path=output_path,
+        bins=bins,
+        dpi=dpi,
     )
 
-    print(f"{args.labels[0]}: kept {valid_a:,}/{total_a:,} valid actions; t-SNE sample {actions_a.shape[0]:,}")
-    print(f"{args.labels[1]}: kept {valid_b:,}/{total_b:,} valid actions; t-SNE sample {actions_b.shape[0]:,}")
-    print(f"Saved plot to {args.output}")
+    print(f"{labels[0]}: kept {valid_a:,}/{total_a:,} valid {spec.name} rows; t-SNE sample {rows_a.shape[0]:,}")
+    print(f"{labels[1]}: kept {valid_b:,}/{total_b:,} valid {spec.name} rows; t-SNE sample {rows_b.shape[0]:,}")
+    print(f"Saved {spec.name} plot to {output_path}")
+
+
+def build_series_specs(args: argparse.Namespace) -> list[SeriesSpec]:
+    """Build action and observation series from CLI options."""
+    obs_abs_threshold = args.observation_abs_threshold
+    if obs_abs_threshold < 0:
+        obs_abs_threshold = None
+
+    specs = [
+        SeriesSpec(
+            name="actions_expert",
+            key_path=("actions_expert",),
+            output_suffix="",
+            expected_dim=7,
+            magnitude_threshold=args.magnitude_threshold,
+        )
+    ]
+    for obs_key in args.obs_keys:
+        safe_key = obs_key.replace("/", "_").replace(".", "_")
+        specs.append(
+            SeriesSpec(
+                name=f"obs.{obs_key}",
+                key_path=("obs", obs_key),
+                output_suffix=f"obs_{safe_key}",
+                abs_threshold=obs_abs_threshold,
+            )
+        )
+    return specs
+
+
+def main() -> None:
+    args = parse_args()
+    labels = tuple(args.labels)
+
+    for spec in build_series_specs(args):
+        plot_series(
+            args.dataset_a,
+            args.dataset_b,
+            spec,
+            labels=labels,
+            output_path=output_path_for_series(args.output, spec),
+            max_samples=args.max_samples_per_dataset,
+            bins=args.bins,
+            perplexity=args.perplexity,
+            seed=args.seed,
+            dpi=args.dpi,
+        )
 
 
 if __name__ == "__main__":

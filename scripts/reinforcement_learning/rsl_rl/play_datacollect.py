@@ -143,7 +143,6 @@ def save_checkpoint(record_path, trajectories, save_info):
 def new_recording():
     return {
         'obs': {k: [] for k in RECORDED_OBS_GROUPS},
-        'next_obs': {k: [] for k in RECORDED_OBS_GROUPS},
         'actions': [],
         'rewards': [],
         'dones': [],
@@ -157,7 +156,6 @@ def reduce_recording(recording):
     return {
         'T': len(recording['actions']),
         'obs': {k: np.stack(recording['obs'][k], axis=0) for k in RECORDED_OBS_GROUPS},
-        'next_obs': {k: np.stack(recording['next_obs'][k], axis=0) for k in RECORDED_OBS_GROUPS},
         'actions': np.stack(recording['actions'], axis=0),
         'rewards': np.stack(recording['rewards'], axis=0),
         'dones': np.stack(recording['dones'], axis=0),
@@ -335,7 +333,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             expert_actions = policy(step_obs)
 
             # agent stepping
-            noised_obs = cur_utils.apply_obs_noise(obs, obsnoise * args_cli.obs_receptive_noise_scale)
+            noised_obs = obs.clone()
+            noised_obs['policy'] = cur_utils.apply_obs_noise_policy(obs['policy'], obsnoise * args_cli.obs_receptive_noise_scale)
             actions = policy(noised_obs)
             actions += actnoise * args_cli.act_noise_scale * GENERAL_NOISE_SCALES
             randnoise = sample_randn((env.num_envs, 7), noise_rng, args_cli.device) * args_cli.rand_noise_scale * GENERAL_NOISE_SCALES
@@ -347,7 +346,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             for i in range(env.num_envs):
                 for k in RECORDED_OBS_GROUPS:
                     current_recordings[i]['obs'][k].append(step_obs[k][i].cpu().numpy())
-                    current_recordings[i]['next_obs'][k].append(obs[k][i].cpu().numpy())
                 current_recordings[i]['actions'].append(actions[i].cpu().numpy())
                 current_recordings[i]['actions_expert'].append(expert_actions[i].cpu().numpy())
                 current_recordings[i]['rewards'].append(rewards[i].cpu().numpy())

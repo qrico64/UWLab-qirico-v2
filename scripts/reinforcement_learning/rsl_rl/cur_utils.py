@@ -73,11 +73,49 @@ def predict_relative_pose(insertive_pose, receptive_pose):
 
 
 
-def apply_obs_noise(obs, obsnoise): # policy2 only
+def apply_obs_noise_policy2(obs: torch.Tensor, obsnoise: torch.Tensor):
     obs = obs.clone()
-    receptive_asset_pose = obs['policy2'][:,37:43]
+    receptive_asset_pose = obs[:,37:43]
     receptive_asset_pose[:, :2] += obsnoise
-    insertive_asset_in_receptive_asset_frame = predict_relative_pose(obs['policy2'][:,31:37], receptive_asset_pose)
-    obs['policy2'][:, 37:43] = receptive_asset_pose
-    obs['policy2'][:, :6] = insertive_asset_in_receptive_asset_frame
+    insertive_asset_pose = obs[:,31:37]
+    insertive_asset_in_receptive_asset_frame = predict_relative_pose(insertive_asset_pose, receptive_asset_pose)
+    obs[:, 37:43] = receptive_asset_pose
+    obs[:, :6] = insertive_asset_in_receptive_asset_frame
     return obs
+
+def apply_obs_noise_policy(obs: torch.Tensor, obsnoise: torch.Tensor):
+    obs = obs.clone()
+    receptive_asset_pose = obs[:,37*5:43*5].reshape(-1, 5, 6)
+    receptive_asset_pose[:, :, :2] += obsnoise.reshape(-1, 1, 2)
+    receptive_asset_pose = receptive_asset_pose.reshape(-1, 6)
+    insertive_asset_pose = obs[:,31*5:37*5].reshape(-1, 6)
+    insertive_asset_in_receptive_asset_frame = predict_relative_pose(insertive_asset_pose, receptive_asset_pose)
+    obs[:, 37*5:43*5] = receptive_asset_pose.reshape(-1, 30)
+    obs[:, :6*5] = insertive_asset_in_receptive_asset_frame.reshape(-1, 30)
+    return obs
+
+def save_info_dict(info: dict, filename: str | pathlib.Path):
+    filepath = pathlib.Path(filename)
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+    with open(filepath, "wb") as fi:
+        pickle.dump(info, fi)
+    with open(filepath.with_suffix(".txt"), "w") as fi:
+        for k, v in info.items():
+            fi.write(f"{k}: {v}\n")
+    print(f"Saved info to {filepath}")
+
+def save_histogram(x, filename, bins=100):
+    # convert to numpy
+    if hasattr(x, "detach"):  # torch tensor
+        x = x.detach().cpu().numpy()
+    else:
+        x = np.asarray(x)
+
+    x = x.reshape(-1)
+
+    plt.figure()
+    plt.hist(x, bins=bins)
+    plt.tight_layout()
+    plt.savefig(filename)
+    print(filename)
+    plt.close()

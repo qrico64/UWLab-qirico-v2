@@ -27,6 +27,7 @@ from torch.utils.data import DataLoader, Dataset
 @dataclass
 class TrajectoryTensors:
     observations: torch.Tensor
+    trajectory_observations: torch.Tensor
     targets: torch.Tensor
     noise_index: int
     original_index: int
@@ -67,6 +68,7 @@ class TrajectoryConditionedDataset(Dataset):
         self.context_length = context_length
         self.sample_random_reference = sample_random_reference
         self.state_dim = trajectories[0].observations.shape[1]
+        self.trajectory_state_dim = trajectories[0].trajectory_observations.shape[1]
         self.action_dim = trajectories[0].targets.shape[1]
 
         self.indices_by_noise_index: dict[int, list[int]] = {}
@@ -94,7 +96,7 @@ class TrajectoryConditionedDataset(Dataset):
 
     def _select_context_window(self, trajectory: TrajectoryTensors) -> tuple[torch.Tensor, torch.Tensor]:
         if trajectory.length <= self.context_length:
-            return trajectory.observations, trajectory.targets
+            return trajectory.trajectory_observations, trajectory.targets
 
         if self.sample_random_reference:
             start = torch.randint(trajectory.length - self.context_length + 1, size=(1,)).item()
@@ -102,7 +104,7 @@ class TrajectoryConditionedDataset(Dataset):
         else:
             window_positions = torch.linspace(0, trajectory.length - 1, steps=self.context_length)
             indices = window_positions.round().long()
-        return trajectory.observations[indices], trajectory.targets[indices]
+        return trajectory.trajectory_observations[indices], trajectory.targets[indices]
 
     def __getitem__(self, dataset_index: int) -> dict[str, torch.Tensor | int]:
         anchor_trajectory = self.trajectories[dataset_index]
@@ -125,6 +127,7 @@ class TrajectoryConditionedTransformer(nn.Module):
     def __init__(
         self,
         state_dim: int,
+        trajectory_state_dim: int,
         action_dim: int,
         hidden_dim: int,
         num_layers: int,
@@ -143,13 +146,14 @@ class TrajectoryConditionedTransformer(nn.Module):
             raise ValueError("Transformer sequence lengths must be positive.")
 
         self.state_dim = state_dim
+        self.trajectory_state_dim = trajectory_state_dim
         self.action_dim = action_dim
         self.hidden_dim = hidden_dim
         self.max_query_length = max_query_length
         self.max_context_length = max_context_length
 
         self.query_projection = nn.Linear(state_dim, hidden_dim)
-        self.context_projection = nn.Linear(state_dim + action_dim, hidden_dim)
+        self.context_projection = nn.Linear(trajectory_state_dim + action_dim, hidden_dim)
         self.type_embeddings = nn.Embedding(2, hidden_dim)
         self.position_embeddings = nn.Embedding(max_query_length + max_context_length, hidden_dim)
 
@@ -250,11 +254,20 @@ def parse_args() -> argparse.Namespace:
         help="Path to the held-out test dataset.",
     )
     parser.add_argument(
-        "--obs-key",
+        "--state-obs-key",
         type=str,
         default="policy",
         choices=("policy", "policy2"),
-        help="Observation group to map from.",
+        help="Observation group used for current/query state tokens.",
+    )
+    parser.add_argument(
+        "--traj-obs-key",
+        "--traj-obe-key",
+        dest="traj_obs_key",
+        type=str,
+        default="policy",
+        choices=("policy", "policy2"),
+        help="Observation group used for conditioned trajectory context tokens.",
     )
     parser.add_argument(
         "--output-dir",
@@ -385,7 +398,8 @@ def trajectory_in_train_scenarios(trajectory: dict, num_train_scenarios: int | N
 
 def load_trajectories(
     path: str,
-    obs_key: str,
+    state_obs_key: str,
+    traj_obs_key: str,
     num_train_scenarios: int | None = None,
     with_noise_value: bool = False,
 ) -> DatasetBundle:
@@ -406,21 +420,29 @@ def load_trajectories(
             num_scenario_filtered_trajectories += 1
             continue
 
-        observations = np.asarray(trajectory["obs"][obs_key], dtype=np.float32)
+        observations = np.asarray(trajectory["obs"][state_obs_key], dtype=np.float32)
+        trajectory_observations = np.asarray(trajectory["obs"][traj_obs_key], dtype=np.float32)
         actions = np.asarray(trajectory["actions"], dtype=np.float32)
         rand_noise = np.asarray(trajectory["rand_noise"], dtype=np.float32)
         targets = actions - rand_noise
+
+        if observations.shape[0] != targets.shape[0]:
+            raise ValueError(
+                f"Trajectory length mismatch in {path}: state obs steps={observations.shape[0]}, "
+                f"target steps={targets.shape[0]}"
+            )
+        if trajectory_observations.shape[0] != targets.shape[0]:
+            raise ValueError(
+                f"Trajectory length mismatch in {path}: conditioned trajectory obs steps="
+                f"{trajectory_observations.shape[0]}, target steps={targets.shape[0]}"
+            )
 
         if with_noise_value:
             obs_noise = np.asarray(trajectory["obs_noise"], dtype=np.float32).reshape(1, -1)
             act_noise = np.asarray(trajectory["act_noise"], dtype=np.float32).reshape(1, -1)
             noise_features = np.repeat(np.concatenate([obs_noise, act_noise], axis=-1), observations.shape[0], axis=0)
             observations = np.concatenate([observations, noise_features], axis=-1)
-
-        if observations.shape[0] != targets.shape[0]:
-            raise ValueError(
-                f"Trajectory length mismatch in {path}: obs steps={observations.shape[0]}, target steps={targets.shape[0]}"
-            )
+            trajectory_observations = np.concatenate([trajectory_observations, noise_features], axis=-1)
 
         noise_index = trajectory.get("noise_index")
         if noise_index is None:
@@ -431,6 +453,7 @@ def load_trajectories(
         kept_trajectories.append(
             TrajectoryTensors(
                 observations=torch.from_numpy(observations),
+                trajectory_observations=torch.from_numpy(trajectory_observations),
                 targets=torch.from_numpy(targets),
                 noise_index=int(noise_index),
                 original_index=original_index,
@@ -553,9 +576,11 @@ def normalize_batch(
     device: torch.device,
     state_mean: torch.Tensor,
     state_std: torch.Tensor,
+    trajectory_state_mean: torch.Tensor,
+    trajectory_state_std: torch.Tensor,
     target_mean: torch.Tensor,
     target_std: torch.Tensor,
-    state_dim: int,
+    trajectory_state_dim: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     current_states = batch["current_states"].to(device, non_blocking=True)
     targets = batch["targets"].to(device, non_blocking=True)
@@ -566,9 +591,9 @@ def normalize_batch(
     normalized_current_states = (current_states - state_mean) / state_std
     normalized_targets = (targets - target_mean) / target_std
 
-    context_states = context_tokens[..., :state_dim]
-    context_actions = context_tokens[..., state_dim:]
-    normalized_context_states = (context_states - state_mean) / state_std
+    context_states = context_tokens[..., :trajectory_state_dim]
+    context_actions = context_tokens[..., trajectory_state_dim:]
+    normalized_context_states = (context_states - trajectory_state_mean) / trajectory_state_std
     normalized_context_actions = (context_actions - target_mean) / target_std
     normalized_context_tokens = torch.cat([normalized_context_states, normalized_context_actions], dim=-1)
 
@@ -589,9 +614,11 @@ def evaluate(
     device: torch.device,
     state_mean: torch.Tensor,
     state_std: torch.Tensor,
+    trajectory_state_mean: torch.Tensor,
+    trajectory_state_std: torch.Tensor,
     target_mean: torch.Tensor,
     target_std: torch.Tensor,
-    state_dim: int,
+    trajectory_state_dim: int,
 ) -> float:
     model.eval()
     loss_sum = 0.0
@@ -604,9 +631,11 @@ def evaluate(
                     device=device,
                     state_mean=state_mean,
                     state_std=state_std,
+                    trajectory_state_mean=trajectory_state_mean,
+                    trajectory_state_std=trajectory_state_std,
                     target_mean=target_mean,
                     target_std=target_std,
-                    state_dim=state_dim,
+                    trajectory_state_dim=trajectory_state_dim,
                 )
             )
             predictions = model(
@@ -629,6 +658,8 @@ def save_checkpoint(
     best_val_loss: float,
     state_mean: torch.Tensor,
     state_std: torch.Tensor,
+    trajectory_state_mean: torch.Tensor,
+    trajectory_state_std: torch.Tensor,
     target_mean: torch.Tensor,
     target_std: torch.Tensor,
     save_dict: dict,
@@ -642,6 +673,8 @@ def save_checkpoint(
             "best_val_loss": best_val_loss,
             "state_mean": state_mean.cpu(),
             "state_std": state_std.cpu(),
+            "trajectory_state_mean": trajectory_state_mean.cpu(),
+            "trajectory_state_std": trajectory_state_std.cpu(),
             "target_mean": target_mean.cpu(),
             "target_std": target_std.cpu(),
         }
@@ -676,13 +709,15 @@ def main() -> None:
 
     full_trainval_bundle = load_trajectories(
         args.train_data,
-        args.obs_key,
+        args.state_obs_key,
+        args.traj_obs_key,
         num_train_scenarios=args.num_train_scenarios,
         with_noise_value=args.with_noise_value,
     )
     test_bundle = load_trajectories(
         args.test_data,
-        args.obs_key,
+        args.state_obs_key,
+        args.traj_obs_key,
         with_noise_value=args.with_noise_value,
     )
 
@@ -713,6 +748,9 @@ def main() -> None:
     )
 
     state_mean, state_std = compute_normalization([trajectory.observations for trajectory in train_trajectories])
+    trajectory_state_mean, trajectory_state_std = compute_normalization(
+        [trajectory.trajectory_observations for trajectory in train_trajectories]
+    )
     target_mean, target_std = compute_normalization([trajectory.targets for trajectory in train_trajectories])
 
     train_loader = build_dataloader(train_dataset, args.batch_size, shuffle=True, num_workers=args.num_workers)
@@ -721,10 +759,12 @@ def main() -> None:
     test_loader = build_dataloader(test_dataset, args.batch_size, shuffle=False, num_workers=args.num_workers)
 
     state_dim = train_trajectories[0].observations.shape[1]
+    trajectory_state_dim = train_trajectories[0].trajectory_observations.shape[1]
     action_dim = train_trajectories[0].targets.shape[1]
     max_query_length = max(trajectory.length for trajectory in full_trainval_bundle.trajectories + test_trajectories)
     model = TrajectoryConditionedTransformer(
         state_dim=state_dim,
+        trajectory_state_dim=trajectory_state_dim,
         action_dim=action_dim,
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
@@ -739,6 +779,8 @@ def main() -> None:
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     state_mean = state_mean.to(device)
     state_std = state_std.to(device)
+    trajectory_state_mean = trajectory_state_mean.to(device)
+    trajectory_state_std = trajectory_state_std.to(device)
     target_mean = target_mean.to(device)
     target_std = target_std.to(device)
 
@@ -748,6 +790,7 @@ def main() -> None:
     model_info = {
         "model_class": model.__class__.__name__,
         "state_dim": state_dim,
+        "trajectory_state_dim": trajectory_state_dim,
         "action_dim": action_dim,
         "hidden_dim": args.hidden_dim,
         "num_layers": args.num_layers,
@@ -759,6 +802,7 @@ def main() -> None:
         "max_context_length": args.context_length,
         "optimizer": optimizer.__class__.__name__,
         "input_normalization": "train_split_state_mean_std",
+        "trajectory_input_normalization": "train_split_trajectory_state_mean_std",
         "target_normalization": "train_split_action_mean_std",
         "with_noise_value": args.with_noise_value,
     }
@@ -812,6 +856,7 @@ def main() -> None:
         config={
             **vars(args),
             "state_dim": state_dim,
+            "trajectory_state_dim": trajectory_state_dim,
             "action_dim": action_dim,
             "train_trajectories": len(train_trajectories),
             "val_trajectories": len(val_trajectories),
@@ -844,9 +889,11 @@ def main() -> None:
                     device=device,
                     state_mean=state_mean,
                     state_std=state_std,
+                    trajectory_state_mean=trajectory_state_mean,
+                    trajectory_state_std=trajectory_state_std,
                     target_mean=target_mean,
                     target_std=target_std,
-                    state_dim=state_dim,
+                    trajectory_state_dim=trajectory_state_dim,
                 )
             )
 
@@ -874,9 +921,11 @@ def main() -> None:
             device=device,
             state_mean=state_mean,
             state_std=state_std,
+            trajectory_state_mean=trajectory_state_mean,
+            trajectory_state_std=trajectory_state_std,
             target_mean=target_mean,
             target_std=target_std,
-            state_dim=state_dim,
+            trajectory_state_dim=trajectory_state_dim,
         )
         val_loss = evaluate(
             model=model,
@@ -884,9 +933,11 @@ def main() -> None:
             device=device,
             state_mean=state_mean,
             state_std=state_std,
+            trajectory_state_mean=trajectory_state_mean,
+            trajectory_state_std=trajectory_state_std,
             target_mean=target_mean,
             target_std=target_std,
-            state_dim=state_dim,
+            trajectory_state_dim=trajectory_state_dim,
         )
         test_loss = evaluate(
             model=model,
@@ -894,9 +945,11 @@ def main() -> None:
             device=device,
             state_mean=state_mean,
             state_std=state_std,
+            trajectory_state_mean=trajectory_state_mean,
+            trajectory_state_std=trajectory_state_std,
             target_mean=target_mean,
             target_std=target_std,
-            state_dim=state_dim,
+            trajectory_state_dim=trajectory_state_dim,
         )
 
         metrics = {
@@ -923,6 +976,8 @@ def main() -> None:
                 best_val_loss,
                 state_mean,
                 state_std,
+                trajectory_state_mean,
+                trajectory_state_std,
                 target_mean,
                 target_std,
                 base_save_dict,
@@ -937,6 +992,8 @@ def main() -> None:
                 best_val_loss,
                 state_mean,
                 state_std,
+                trajectory_state_mean,
+                trajectory_state_std,
                 target_mean,
                 target_std,
                 base_save_dict,
