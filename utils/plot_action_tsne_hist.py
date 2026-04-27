@@ -229,8 +229,8 @@ def nearest_neighbor_coverage_diagnostic(
     # Quantile-based coverage score.
     # Example: a B point is "covered" if its nearest-A distance is within
     # the 95th percentile of normal A-to-A nearest-neighbor distances.
-    threshold_d1 = np.quantile(a_to_a_d1, 0.99)
-    threshold_dk = np.quantile(a_to_a_dk_mean, 0.99)
+    threshold_d1 = np.quantile(a_to_a_d1, 0.995)
+    threshold_dk = np.quantile(a_to_a_dk_mean, 0.995)
 
     coverage_d1 = np.mean(b_to_a_d1 <= threshold_d1)
     coverage_dk = np.mean(b_to_a_dk_mean <= threshold_dk)
@@ -242,8 +242,8 @@ def nearest_neighbor_coverage_diagnostic(
     print(f"  B->A mean-k covered fraction: {coverage_dk:.4f}")
 
     # Clip plot x-axis to the lower 95% of distances so rare outliers do not blow up the scale.
-    d1_xmax = np.quantile(np.concatenate([a_to_a_d1, b_to_a_d1]), 0.99)
-    dk_xmax = np.quantile(np.concatenate([a_to_a_dk_mean, b_to_a_dk_mean]), 0.99)
+    d1_xmax = np.quantile(np.concatenate([a_to_a_d1, b_to_a_d1]), 0.995)
+    dk_xmax = np.quantile(np.concatenate([a_to_a_dk_mean, b_to_a_dk_mean]), 0.995)
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.5), constrained_layout=True)
 

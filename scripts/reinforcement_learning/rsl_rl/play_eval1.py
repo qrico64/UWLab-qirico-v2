@@ -787,6 +787,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             if not np.isnan(success_rate):
                 success_rates.append(success_rate)
         
+        checkpoints = checkpoints[1:] + checkpoints[:1]
+        success_rates = success_rates[1:] + success_rates[:1]
         print(checkpoints)
         print(success_rates)
         (base_policy_file / "viz").mkdir(parents=True, exist_ok=True)

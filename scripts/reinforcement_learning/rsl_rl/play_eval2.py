@@ -49,6 +49,8 @@ parser.add_argument("--reset_mode", type=str, default='none', help="Options: non
 parser.add_argument("--our_task", choices=["drawer", "leg", "peg"], default=None)
 parser.add_argument("--sim_device", type=str, default="cuda:0", help="Device to run the simulation on.")
 parser.add_argument("--noise_scale", type=float, default=1, help="Noise scale on both obs and action noises.")
+parser.add_argument("--noises-from-dataset", type=str, default=None, help="Dataset path to load fixed noises from.")
+parser.add_argument("--noises-from-dataset-index", type=int, default=0, help="noise_index to load from the dataset.")
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -234,6 +236,21 @@ def save_model_at_checkpoint(model: train_lib.RobotTransformerPolicy, save_path:
     print(f"Model at epoch {epoch} saved to {csp}")
 
 
+def load_noises_from_dataset(dataset_path: str, noise_index: int, device: str):
+    with open(dataset_path, "rb") as fi:
+        trajs = pickle.load(fi)
+
+    matches = [traj for traj in trajs if int(traj["noise_index"]) == noise_index]
+    if len(matches) == 0:
+        available = sorted({int(traj["noise_index"]) for traj in trajs})
+        raise ValueError(f"noise_index {noise_index} not found in {dataset_path}. Available: {available}")
+
+    traj = matches[0]
+    act_noise = torch.tensor(np.asarray(traj["act_noise"], dtype=np.float32), dtype=torch.float32, device=device)
+    obs_noise = torch.tensor(np.asarray(traj["obs_noise"], dtype=np.float32), dtype=torch.float32, device=device)
+    return obs_noise, act_noise
+
+
 
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
@@ -403,10 +420,20 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     USING_FIXED_NOISE = False
     if args_cli.base_policy == "expert":
         USING_FIXED_NOISE = True
-        sys_noises = torch.tensor([0.7432, 0.5431, -0.6655, 0.2321, 0.1166, 0.2186, 0.8714], dtype=torch.float32, device=args_cli.device) * correction_model_info['act_noise_scale'] * GENERAL_NOISE_SCALES
-        obs_receptive_noise = torch.tensor([0.3047, -1.0399], dtype=torch.float32, device=args_cli.device) * correction_model_info['obs_receptive_noise_scale']
+        sys_noises = torch.tensor([0.2235955446958542, 0.6789135336875916, 0.06757906824350357, 0.2891193926334381, 0.6312882304191589, -1.4571558237075806, -0.3196712136268616], dtype=torch.float32, device=args_cli.device) * correction_model_info['act_noise_scale'] * GENERAL_NOISE_SCALES
+        obs_receptive_noise = torch.tensor([0.7504512071609497, 0.9405646920204163], dtype=torch.float32, device=args_cli.device) * correction_model_info['obs_receptive_noise_scale']
         sys_noises *= args_cli.noise_scale
         obs_receptive_noise *= args_cli.noise_scale
+    if args_cli.noises_from_dataset is not None:
+        USING_FIXED_NOISE = True
+        raw_obs_noise, raw_act_noise = load_noises_from_dataset(
+            args_cli.noises_from_dataset, args_cli.noises_from_dataset_index, args_cli.device
+        )
+        sys_noises = raw_act_noise * correction_model_info['act_noise_scale'] * GENERAL_NOISE_SCALES
+        obs_receptive_noise = raw_obs_noise * correction_model_info['obs_receptive_noise_scale']
+        sys_noises *= args_cli.noise_scale
+        obs_receptive_noise *= args_cli.noise_scale
+        print(f"Loaded noises from {args_cli.noises_from_dataset} at noise_index {args_cli.noises_from_dataset_index}")
     base_policy_info['obs_receptive_noise'] = obs_receptive_noise
     base_policy_info['obs_insertive_noise'] = obs_insertive_noise
     base_policy_info['sys_noise'] = sys_noises

@@ -9,7 +9,7 @@
 #SBATCH --gres=gpu:a40:1               # GPUs per node (if needed)
 #SBATCH --mem=60G                  # Memory per node
 #SBATCH --partition=ckpt-all        # Partition (queue) name
-#SBATCH --account=stf         # Slurm account/project name
+#SBATCH --account=weirdlab         # Slurm account/project name
 
 # Load environment
 cd /mmfs1/gscratch/weirdlab/qirico/Meta-Learning-25-10-1/UWLab-qirico-v2
@@ -65,23 +65,25 @@ export EPOCHS=1000
 export OUR_TASK=peg
 
 export CORRECTION_MODEL=$CORRECTION_MODEL_DIR/1000-ckpt.pt
-export SAVE_PATH=$CORRECTION_MODEL_DIR/finetune-id_expert_noisei0_filtering
+export SAVE_PATH=$CORRECTION_MODEL_DIR/finetune-id_expert_oodnoisei9
 
-# HYDRA_FULL_ERROR=1 /isaac-sim/python.sh scripts/reinforcement_learning/rsl_rl/play_eval2.py \
-#   --task OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Play-v0 \
-#   --our_task $OUR_TASK \
-#   --headless \
-#   --num_envs 10 \
-#   --num_evals $EPOCHS \
-#   --finetune_mode residual \
-#   --base_policy expert \
-#   --correction_model $CORRECTION_MODEL \
-#   --save_path $SAVE_PATH \
-#   --utd_ratio 1.0 \
-#   --finetune_arch full \
-#   --lr 5e-5 \
-#   --reset_mode recxgeq05_recygeq015 \
-#   --seed 50
+HYDRA_FULL_ERROR=1 /isaac-sim/python.sh scripts/reinforcement_learning/rsl_rl/play_eval2.py \
+  --task OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Play-v0 \
+  --our_task $OUR_TASK \
+  --headless \
+  --num_envs 10 \
+  --num_evals $EPOCHS \
+  --finetune_mode residual \
+  --base_policy expert \
+  --correction_model $CORRECTION_MODEL \
+  --save_path $SAVE_PATH \
+  --utd_ratio 1.0 \
+  --finetune_arch full \
+  --lr 5e-5 \
+  --reset_mode recxgeq05_recygeq015 \
+  --seed 50 \
+  --noises-from-dataset collected_data/data_apr25_a2r2o0015n20_2/trajectories.pkl \
+  --noises-from-dataset-index 9 \
 
 HYDRA_FULL_ERROR=1 /isaac-sim/python.sh scripts/reinforcement_learning/rsl_rl/play_eval1.py \
   --task OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Play-v0 \
