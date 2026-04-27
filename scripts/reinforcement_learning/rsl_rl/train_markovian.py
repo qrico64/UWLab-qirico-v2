@@ -334,6 +334,17 @@ def save_checkpoint(
         pickle.dump(checkpoint, f)
 
 
+def save_info_dict(info: dict, filename: str | Path) -> None:
+    filepath = Path(filename)
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+    with open(filepath, "wb") as f:
+        pickle.dump(info, f)
+    with open(filepath.with_suffix(".txt"), "w") as f:
+        for key, value in info.items():
+            f.write(f"{key}: {value}\n")
+    print(f"Saved info to {filepath}")
+
+
 def main() -> None:
     args = parse_args()
     args.run_name = args.run_name or None
@@ -465,9 +476,11 @@ def main() -> None:
     }
     base_save_dict = {
         "args": vars(args),
+        "train_dataset_size": len(train_dataset),
         "model_info": model_info,
         "dataset_info": dataset_info,
     }
+    save_info_dict(base_save_dict, Path(args.output_dir) / "info.pkl")
 
     wandb.init(
         project=args.experiment_name,

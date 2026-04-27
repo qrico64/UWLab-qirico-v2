@@ -1,7 +1,7 @@
 #!/bin/bash -l
 #SBATCH --job-name=data        # Job name
-#SBATCH --output=collected_data/data_apr25_a2r2o003n100_1/log/%j_%x_out.txt        # Output file (%j = job ID)
-#SBATCH --error=collected_data/data_apr25_a2r2o003n100_1/log/%j_%x_err.txt         # Error file
+#SBATCH --output=collected_data/data_apr25_a2r2o0015n100_1/log/%j_%x_out.txt        # Output file (%j = job ID)
+#SBATCH --error=collected_data/data_apr25_a2r2o0015n100_1/log/%j_%x_err.txt         # Error file
 #SBATCH --time=24:00:00            # Time limit (hh:mm:ss)
 #SBATCH --nodes=1                  # Number of nodes
 #SBATCH --ntasks=1                 # Number of tasks (MPI ranks)
@@ -53,12 +53,12 @@ HYDRA_FULL_ERROR=1 /isaac-sim/python.sh scripts/reinforcement_learning/rsl_rl/pl
     env.scene.insertive_object=peg \
     env.scene.receptive_object=peghole \
     --headless \
-    --record_path collected_data/data_apr25_a2r2o003n100_1/trajectories.pkl \
+    --record_path collected_data/data_apr25_a2r2o0015n100_1/trajectories.pkl \
     --num_trajectories 100000 \
     --horizon 60 \
     --act_noise_scale 2.0 \
     --rand_noise_scale 2.0 \
-    --obs_receptive_noise_scale 0.03 \
+    --obs_receptive_noise_scale 0.015 \
     --num_discrete_noises 100 \
     --seed 42
 
