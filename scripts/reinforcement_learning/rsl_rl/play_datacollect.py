@@ -43,6 +43,7 @@ parser.add_argument("--act_noise_scale", type=float, default=0, help="Scale of a
 parser.add_argument("--rand_noise_scale", type=float, default=0, help="Scale of action random noise.")
 parser.add_argument("--obs_receptive_noise_scale", type=float, default=0, help="Scale of receptive object in observation noise.")
 parser.add_argument("--num_discrete_noises", type=int, default=None, help="Number of discrete action/obs noise scenarios.")
+parser.add_argument("--high_friction_randomizations", action="store_true", default=False, help="Sample friction from the upper half of each configured randomization range.")
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -175,6 +176,26 @@ def sample_randint(high, size, rng, device):
     return torch.tensor(rng.integers(high, size=size), dtype=torch.long, device=device)
 
 
+def use_continuous_noise(num_discrete_noises):
+    return num_discrete_noises is None or num_discrete_noises == -1
+
+
+def upper_half_range(value_range):
+    low, high = value_range
+    return ((low + high) / 2, high)
+
+
+def set_high_friction_randomizations(events_cfg):
+    for event_name in dir(events_cfg):
+        if event_name.startswith("_"):
+            continue
+        params = getattr(getattr(events_cfg, event_name), "params", None)
+        if not isinstance(params, dict) or "static_friction_range" not in params or "dynamic_friction_range" not in params:
+            continue
+        params["static_friction_range"] = upper_half_range(params["static_friction_range"])
+        params["dynamic_friction_range"] = upper_half_range(params["dynamic_friction_range"])
+
+
 
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
@@ -243,6 +264,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print(f"Video generation on at size/resolution {IMAGE_SIZE}")
 
     env_cfg.events.reset_from_reset_states.params['reset_mode'] = args_cli.reset_mode
+    if args_cli.high_friction_randomizations:
+        set_high_friction_randomizations(env_cfg.events)
 
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
@@ -304,6 +327,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         'rand_noise_scale': args_cli.rand_noise_scale,
         'obs_receptive_noise_scale': args_cli.obs_receptive_noise_scale,
         'num_discrete_noises': args_cli.num_discrete_noises,
+        'high_friction_randomizations': args_cli.high_friction_randomizations,
     }
 
     # reset environment
@@ -314,7 +338,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     last_saved_count = 0
     GENERAL_NOISE_SCALES = torch.Tensor(cur_utils.GENERAL_NOISE_SCALES).to(device=args_cli.device)
     noise_rng = np.random.default_rng(agent_cfg.seed)
-    if args_cli.num_discrete_noises is None:
+    continuous_noise = use_continuous_noise(args_cli.num_discrete_noises)
+    if continuous_noise:
         obsnoise = sample_randn((env.num_envs, 2), noise_rng, args_cli.device)
         actnoise = sample_randn((env.num_envs, 7), noise_rng, args_cli.device)
         noise_index = None
@@ -357,7 +382,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     current_recordings[i]['noise_index'] = None if noise_index is None else noise_index[i].cpu().item()
                     completed_recordings.append(reduce_recording(current_recordings[i]))
                     current_recordings[i] = new_recording()
-                    if noise_index is None:
+                    if continuous_noise:
                         obsnoise[i] = sample_randn(2, noise_rng, args_cli.device)
                         actnoise[i] = sample_randn(7, noise_rng, args_cli.device)
                     else:
