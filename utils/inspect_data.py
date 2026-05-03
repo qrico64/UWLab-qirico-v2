@@ -158,7 +158,7 @@ def plot_actions_tsne(actions, n_components=2, filename="tsne_plot.png"):
 
 
 def main():
-    FILENAME = "collected_data/data_apr25_a2r2o0015n20_1/trajectories.pkl"
+    FILENAME = "collected_data/data_may2_r3n1_2/trajectories.pkl"
     FILENAME = Path(FILENAME)
     VIZ_DIR = FILENAME.parent / "viz"
     VIZ_DIR.mkdir(exist_ok=True, parents=True)
@@ -167,6 +167,8 @@ def main():
     print_and_save_noise_values(trajs, FILENAME)
     lengths = [traj['actions'].shape[0] for traj in trajs]
     save_histogram(lengths, VIZ_DIR / "lengths.png", bins=40)
+    static_friction = [traj['dynamics']['insertive_object.material.shape_0.static_friction'] for traj in trajs]
+    save_histogram(static_friction, VIZ_DIR / "insertive_object_static_friction.png", bins=100)
     # receptive_starting_positions = np.stack([traj['starting_position']['receptive_position'][:2] for traj in trajs], axis=0)
     # save_point_distribution_image(receptive_starting_positions, VIZ_DIR / "receptive_starting_positions.png", fixed_bounds=True)
     # insertive_starting_positions = np.stack([traj['starting_position']['insertive_position'][:2] for traj in trajs], axis=0)

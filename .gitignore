@@ -67,7 +67,7 @@ _build
 /datasets/
 
 # Tests
-tests/
+./tests/
 
 # Docker history
 .uw-lab-docker-history
