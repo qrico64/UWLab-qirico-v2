@@ -46,21 +46,24 @@ apptainer exec --nv \
   uw-lab-2_latest.sif \
   bash -lc 'set -e
 
-HYDRA_FULL_ERROR=1 /isaac-sim/python.sh scripts/reinforcement_learning/rsl_rl/play_datacollect.py \
+HYDRA_FULL_ERROR=1 /isaac-sim/python.sh scripts/reinforcement_learning/rsl_rl/play_datacollect_dynamics.py \
     --task OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Play-v0 \
     --num_envs 2500 \
     --checkpoint expert_policies/peg_state_rl_expert_seed42.pt \
     env.scene.insertive_object=peg \
     env.scene.receptive_object=peghole \
     --headless \
-    --record_path collected_data/data_apr27_a2r2o0015ninf_upperfriction_1/trajectories.pkl \
+    --record_path collected_data/data_may2_r3n1_2/trajectories.pkl \
     --num_trajectories 100000 \
     --horizon 60 \
-    --act_noise_scale 2.0 \
-    --rand_noise_scale 2.0 \
-    --obs_receptive_noise_scale 0.015 \
-    --num_discrete_noises -1 \
-    --high_friction_randomizations \
-    --seed 42
+    --act_noise_scale 0.0 \
+    --rand_noise_scale 3.0 \
+    --obs_receptive_noise_scale 0.0 \
+    --num_discrete_noises 1 \
+    --seed 42 \
+    --insertive-object-static-friction-range 1.0 2.0 \
+    --insertive-object-dynamic-friction-range 0.9 1.9 \
+    --receptive-object-static-friction-range 0.2 0.6 \
+    --receptive-object-dynamic-friction-range 0.15 0.5 \
 
 '

@@ -22,6 +22,12 @@ FRICTION_SPLIT_THRESHOLDS = {
     "receptive_object.material.shape_0.static_friction": 0.4,
     "receptive_object.material.shape_0.dynamic_friction": 0.35,
 }
+FRICTION_SPLIT_THRESHOLDS_LOWER = {
+    "insertive_object.material.shape_0.static_friction": 1.4,
+    "insertive_object.material.shape_0.dynamic_friction": 1.3,
+    "receptive_object.material.shape_0.static_friction": 0.35,
+    "receptive_object.material.shape_0.dynamic_friction": 0.3,
+}
 
 
 @dataclass
@@ -30,6 +36,14 @@ class SplitData:
     targets: torch.Tensor
     num_trajectories: int
     num_transitions: int
+
+
+@dataclass
+class FilteredTrajectories:
+    trajectories: list[dict]
+    num_total_trajectories: int
+    num_short_trajectories: int
+    num_large_action_trajectories: int
 
 
 class TensorDataset(Dataset):
@@ -65,12 +79,15 @@ class MLP(nn.Module):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data", type=str, default="collected_data/data_may2_r3n1_2/trajectories.pkl")
+    parser.add_argument("--test-data", type=str, default=None)
     parser.add_argument("--obs-key", type=str, default="policy", choices=("policy", "policy2"))
     parser.add_argument("--with-dynamic-parameters", action="store_true")
     parser.add_argument("--hidden-dims", type=str, default="512,512,512")
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=4096)
+    parser.add_argument("--val-fraction", type=float, default=0.1)
+    parser.add_argument("--prediction-length", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
     parser.add_argument("--num-workers", type=int, default=0)
@@ -105,7 +122,8 @@ def split_trajectory(trajectory: dict) -> str | None:
     values = [float(dynamics[key]) >= threshold for key, threshold in FRICTION_SPLIT_THRESHOLDS.items()]
     if all(values):
         return "train"
-    if not any(values):
+    values_lower = [float(dynamics[key]) < threshold for key, threshold in FRICTION_SPLIT_THRESHOLDS_LOWER.items()]
+    if all(values_lower):
         return "test"
     return None
 
@@ -116,12 +134,35 @@ def has_large_action(trajectory: dict, threshold: float = 100.0) -> bool:
     return bool(np.any(magnitudes > threshold))
 
 
+def load_filtered_trajectories(path: str) -> FilteredTrajectories:
+    with open(path, "rb") as f:
+        trajectories = pickle.load(f)
+    if not trajectories:
+        raise ValueError(f"No trajectories found in {path}")
+
+    num_total_trajectories = len(trajectories)
+    num_short_trajectories = sum(int(trajectory["T"]) <= 10 for trajectory in trajectories)
+    trajectories = [trajectory for trajectory in trajectories if int(trajectory["T"]) > 10]
+    num_large_action_trajectories = sum(has_large_action(trajectory) for trajectory in trajectories)
+    trajectories = [trajectory for trajectory in trajectories if not has_large_action(trajectory)]
+    if not trajectories:
+        raise ValueError(f"No trajectories remain after filtering dataset {path}.")
+
+    return FilteredTrajectories(
+        trajectories=trajectories,
+        num_total_trajectories=num_total_trajectories,
+        num_short_trajectories=num_short_trajectories,
+        num_large_action_trajectories=num_large_action_trajectories,
+    )
+
+
 def build_split(
     trajectories: list[dict],
     split_name: str,
     obs_key: str,
     with_dynamic_parameters: bool,
     dynamics_keys: list[str],
+    prediction_length: int,
 ) -> SplitData:
     inputs = []
     targets = []
@@ -129,18 +170,31 @@ def build_split(
 
     for trajectory in trajectories:
         observations = np.asarray(trajectory["obs"][obs_key], dtype=np.float32)
+        target_observations = np.asarray(trajectory["obs"]["policy2"], dtype=np.float32)
         actions = np.asarray(trajectory["actions"], dtype=np.float32)
-        steps = min(observations.shape[0], actions.shape[0]) - 1
+        steps = min(
+            observations.shape[0],
+            target_observations.shape[0] - prediction_length,
+            actions.shape[0] - prediction_length + 1,
+        )
         if steps <= 0:
             continue
 
-        split_inputs = [observations[:steps], actions[:steps]]
+        action_windows = np.stack(
+            [actions[i : i + prediction_length] for i in range(steps)],
+            axis=0,
+        ).reshape(steps, -1)
+        target_windows = np.stack(
+            [target_observations[i + 1 : i + prediction_length + 1] for i in range(steps)],
+            axis=0,
+        ).reshape(steps, -1)
+        split_inputs = [observations[:steps], action_windows]
         if with_dynamic_parameters:
             dynamic_params = np.repeat(dynamics_vector(trajectory, dynamics_keys)[None, :], steps, axis=0)
             split_inputs.append(dynamic_params)
 
         inputs.append(np.concatenate(split_inputs, axis=-1))
-        targets.append(observations[1 : steps + 1])
+        targets.append(target_windows)
         num_trajectories += 1
 
     if not inputs:
@@ -180,39 +234,66 @@ def main() -> None:
     hidden_dims = [int(dim) for dim in args.hidden_dims.split(",") if dim]
     if not hidden_dims:
         raise ValueError("--hidden-dims must contain at least one layer size.")
+    if args.prediction_length < 1:
+        raise ValueError("--prediction-length must be at least 1.")
 
     set_seed(args.seed)
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is not available.")
 
-    with open(args.data, "rb") as f:
-        trajectories = pickle.load(f)
-    if not trajectories:
-        raise ValueError(f"No trajectories found in {args.data}")
-    num_total_trajectories = len(trajectories)
-    num_short_trajectories = sum(int(trajectory["T"]) <= 10 for trajectory in trajectories)
-    trajectories = [trajectory for trajectory in trajectories if int(trajectory["T"]) > 10]
-    num_large_action_trajectories = sum(has_large_action(trajectory) for trajectory in trajectories)
-    trajectories = [trajectory for trajectory in trajectories if not has_large_action(trajectory)]
-    if not trajectories:
-        raise ValueError("No trajectories remain after filtering.")
+    train_bundle = load_filtered_trajectories(args.data)
+    trajectories = train_bundle.trajectories
 
     dynamics_keys = sorted(trajectories[0]["dynamics"].keys()) if args.with_dynamic_parameters else []
-    train_trajectories = []
-    test_trajectories = []
-    num_unused_split_trajectories = 0
-    for trajectory in trajectories:
-        split = split_trajectory(trajectory)
-        if split == "train":
-            train_trajectories.append(trajectory)
-        elif split == "test":
-            test_trajectories.append(trajectory)
-        else:
-            num_unused_split_trajectories += 1
+    test_bundle = load_filtered_trajectories(args.test_data) if args.test_data else None
+    if test_bundle is not None:
+        train_trajectories = trajectories
+        test_trajectories = test_bundle.trajectories
+        num_unused_split_trajectories = 0
+    else:
+        train_trajectories = []
+        test_trajectories = []
+        num_unused_split_trajectories = 0
+        for trajectory in trajectories:
+            split = split_trajectory(trajectory)
+            if split == "train":
+                train_trajectories.append(trajectory)
+            elif split == "test":
+                test_trajectories.append(trajectory)
+            else:
+                num_unused_split_trajectories += 1
 
-    train = build_split(train_trajectories, "train", args.obs_key, args.with_dynamic_parameters, dynamics_keys)
-    test = build_split(test_trajectories, "test", args.obs_key, args.with_dynamic_parameters, dynamics_keys)
+    train = build_split(
+        train_trajectories,
+        "train",
+        args.obs_key,
+        args.with_dynamic_parameters,
+        dynamics_keys,
+        args.prediction_length,
+    )
+    test = build_split(
+        test_trajectories,
+        "test",
+        args.obs_key,
+        args.with_dynamic_parameters,
+        dynamics_keys,
+        args.prediction_length,
+    )
+    if not 0.0 < args.val_fraction < 1.0:
+        raise ValueError("--val-fraction must be greater than 0 and less than 1.")
+    if train.num_transitions < 2:
+        raise ValueError("Need at least two train transitions to create a validation split.")
+    num_val = max(1, min(int(round(train.num_transitions * args.val_fraction)), train.num_transitions - 1))
+    indices = torch.randperm(train.num_transitions)
+    val_indices, train_indices = indices[:num_val], indices[num_val:]
+    val = SplitData(train.inputs[val_indices], train.targets[val_indices], train.num_trajectories, num_val)
+    train = SplitData(
+        train.inputs[train_indices],
+        train.targets[train_indices],
+        train.num_trajectories,
+        train_indices.shape[0],
+    )
     input_mean, input_std = compute_normalization(train.inputs)
     target_mean, target_std = compute_normalization(train.targets)
 
@@ -226,6 +307,14 @@ def main() -> None:
     )
     train_eval_loader = DataLoader(
         TensorDataset(train.inputs, train.targets),
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=args.num_workers > 0,
+    )
+    val_loader = DataLoader(
+        TensorDataset(val.inputs, val.targets),
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
@@ -261,20 +350,29 @@ def main() -> None:
             "train_trajectories": train.num_trajectories,
             "test_trajectories": test.num_trajectories,
             "train_transitions": train.num_transitions,
+            "val_transitions": val.num_transitions,
             "test_transitions": test.num_transitions,
-            "num_total_trajectories": num_total_trajectories,
-            "num_short_trajectories": num_short_trajectories,
-            "num_large_action_trajectories": num_large_action_trajectories,
+            "num_total_trajectories": train_bundle.num_total_trajectories,
+            "num_short_trajectories": train_bundle.num_short_trajectories,
+            "num_large_action_trajectories": train_bundle.num_large_action_trajectories,
             "num_kept_trajectories": len(trajectories),
+            "num_total_test_trajectories": test_bundle.num_total_trajectories if test_bundle is not None else 0,
+            "num_short_test_trajectories": test_bundle.num_short_trajectories if test_bundle is not None else 0,
+            "num_large_action_test_trajectories": (
+                test_bundle.num_large_action_trajectories if test_bundle is not None else 0
+            ),
+            "num_kept_test_trajectories": len(test_bundle.trajectories) if test_bundle is not None else 0,
             "num_unused_split_trajectories": num_unused_split_trajectories,
             "friction_split_thresholds": FRICTION_SPLIT_THRESHOLDS,
             "dynamics_keys": dynamics_keys,
+            "uses_external_test_data": test_bundle is not None,
         },
     )
     split_sizes = {
         "dataset/train_trajectories": train.num_trajectories,
         "dataset/test_trajectories": test.num_trajectories,
         "dataset/train_transitions": train.num_transitions,
+        "dataset/val_transitions": val.num_transitions,
         "dataset/test_transitions": test.num_transitions,
         "dataset/unused_split_trajectories": num_unused_split_trajectories,
     }
@@ -285,6 +383,7 @@ def main() -> None:
         f"train_trajectories={train.num_trajectories} "
         f"test_trajectories={test.num_trajectories} "
         f"train_transitions={train.num_transitions} "
+        f"val_transitions={val.num_transitions} "
         f"test_transitions={test.num_transitions} "
         f"unused_split_trajectories={num_unused_split_trajectories}"
     )
@@ -307,9 +406,11 @@ def main() -> None:
             count += inputs.shape[0]
 
         train_loss = evaluate(model, train_eval_loader, input_mean, input_std, target_mean, target_std, device)
+        val_loss = evaluate(model, val_loader, input_mean, input_std, target_mean, target_std, device)
         test_loss = evaluate(model, test_loader, input_mean, input_std, target_mean, target_std, device)
-        wandb.log({"loss/train": train_loss, "loss/test": test_loss, "epoch": epoch}, step=epoch)
-        print(f"epoch={epoch:04d} train_loss={train_loss:.6f} test_loss={test_loss:.6f}")
+        metrics = {"loss/train": train_loss, "loss/val": val_loss, "loss/test": test_loss, "epoch": epoch}
+        wandb.log(metrics, step=epoch)
+        print(f"epoch={epoch:04d} train_loss={train_loss:.6f} val_loss={val_loss:.6f} test_loss={test_loss:.6f}")
 
     wandb.finish()
 
