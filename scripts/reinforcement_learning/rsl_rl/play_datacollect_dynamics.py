@@ -227,6 +227,16 @@ def use_continuous_noise(num_discrete_noises):
     return num_discrete_noises is None or num_discrete_noises == -1
 
 
+def make_balanced_noise_schedule(num_discrete_noises, num_trajectories, rng, device):
+    if num_discrete_noises <= 0:
+        raise ValueError("--num_discrete_noises must be positive, or -1 for continuous noise.")
+    if num_trajectories % num_discrete_noises != 0:
+        raise ValueError("--num_trajectories must be divisible by --num_discrete_noises for balanced sampling.")
+    noise_schedule = np.repeat(np.arange(num_discrete_noises), num_trajectories // num_discrete_noises)
+    rng.shuffle(noise_schedule)
+    return torch.tensor(noise_schedule, dtype=torch.long, device=device)
+
+
 def upper_half_range(value_range):
     low, high = value_range
     return ((low + high) / 2, high)
@@ -530,7 +540,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     else:
         obsnoise_scenarios = sample_randn((args_cli.num_discrete_noises, 2), noise_rng, args_cli.device)
         actnoise_scenarios = sample_randn((args_cli.num_discrete_noises, 7), noise_rng, args_cli.device)
-        noise_index = sample_randint(args_cli.num_discrete_noises, env.num_envs, noise_rng, args_cli.device)
+        noise_schedule = make_balanced_noise_schedule(
+            args_cli.num_discrete_noises, args_cli.num_trajectories, noise_rng, args_cli.device
+        )
+        next_noise_schedule_index = env.num_envs
+        noise_index = noise_schedule[torch.arange(env.num_envs, device=args_cli.device) % len(noise_schedule)]
         obsnoise = obsnoise_scenarios[noise_index]
         actnoise = actnoise_scenarios[noise_index]
     
@@ -570,7 +584,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                         obsnoise[i] = sample_randn(2, noise_rng, args_cli.device)
                         actnoise[i] = sample_randn(7, noise_rng, args_cli.device)
                     else:
-                        noise_index[i] = sample_randint(args_cli.num_discrete_noises, (), noise_rng, args_cli.device)
+                        noise_index[i] = noise_schedule[next_noise_schedule_index % len(noise_schedule)]
+                        next_noise_schedule_index += 1
                         obsnoise[i] = obsnoise_scenarios[noise_index[i]]
                         actnoise[i] = actnoise_scenarios[noise_index[i]]
 
