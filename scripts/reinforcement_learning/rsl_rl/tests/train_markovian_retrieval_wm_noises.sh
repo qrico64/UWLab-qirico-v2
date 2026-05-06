@@ -3,7 +3,7 @@ cd /mmfs1/gscratch/weirdlab/qirico/Meta-Learning-25-10-1/UWLab-qirico-v2
 source a.sh
 
 python scripts/reinforcement_learning/rsl_rl/tests/train_markovian_retrieval_wm_noises.py \
-  --data collected_data/data_may4_a2r2o002n500_per100_1/trajectories.pkl \
+  --data collected_data/data_may5_r4n500_per100_1/trajectories.pkl \
   --train-noise-fraction 0.5 \
   --val-fraction 0.1 \
   --trajectories-per-noise 100 \
@@ -20,7 +20,8 @@ python scripts/reinforcement_learning/rsl_rl/tests/train_markovian_retrieval_wm_
   --num-workers 4 \
   --device cuda \
   --seed 42 \
+  --retrieval-mode policy \
+  --save_path experiments/may5/may5-markovian_retrieval_wm_r4n500_per100_1_policy \
   --wandb-project markovian_policy \
-  --zero-retrieved-transition \
-  --wandb-run-name "may5-markovian_retrieval_wm_noises_zero_retrieved_a2r2o002n500_per100_1_lr2e4_d11" \
+  --wandb-run-name "may5-markovian_retrieval_wm_r4n500_per100_1_policy" \
   --wandb-mode online
