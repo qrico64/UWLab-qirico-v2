@@ -88,6 +88,12 @@ parser.add_argument("--act_noise_scale", type=float, default=0, help="Scale of a
 parser.add_argument("--rand_noise_scale", type=float, default=0, help="Scale of action random noise.")
 parser.add_argument("--obs_receptive_noise_scale", type=float, default=0, help="Scale of receptive object in observation noise.")
 parser.add_argument("--num_discrete_noises", type=int, default=None, help="Number of discrete action/obs noise scenarios.")
+parser.add_argument(
+    "--fix_object_position_per_noise_index",
+    action="store_true",
+    default=False,
+    help="Reset all trajectories with the same discrete noise_index to the same object poses.",
+)
 add_dynamics_randomization_args(parser)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
@@ -235,6 +241,44 @@ def make_balanced_noise_schedule(num_discrete_noises, num_trajectories, rng, dev
     noise_schedule = np.repeat(np.arange(num_discrete_noises), num_trajectories // num_discrete_noises)
     rng.shuffle(noise_schedule)
     return torch.tensor(noise_schedule, dtype=torch.long, device=device)
+
+
+def get_object_positions(env):
+    receptive_object = env.scene["receptive_object"]
+    insertive_object = env.scene["insertive_object"]
+    positions = torch.cat(
+        [
+            receptive_object.data.root_pos_w,
+            receptive_object.data.root_quat_w,
+            insertive_object.data.root_pos_w,
+            insertive_object.data.root_quat_w,
+        ],
+        dim=-1,
+    )
+    positions = positions.clone()
+    positions[:, :3] -= env.scene.env_origins
+    positions[:, 7:10] -= env.scene.env_origins
+    return positions
+
+
+def set_object_positions(env, position, env_id):
+    position = position.clone()
+    position[:3] += env.scene.env_origins[env_id]
+    position[7:10] += env.scene.env_origins[env_id]
+    env_ids = torch.tensor([env_id], device=env.device)
+    receptive_object = env.scene["receptive_object"]
+    insertive_object = env.scene["insertive_object"]
+    receptive_object.write_root_pose_to_sim(position[:7].unsqueeze(0), env_ids=env_ids)
+    insertive_object.write_root_pose_to_sim(position[7:].unsqueeze(0), env_ids=env_ids)
+    assert not hasattr(receptive_object, "initial_pos")
+    assert not hasattr(insertive_object, "initial_pos")
+
+
+def set_fixed_object_position_for_noise(env, fixed_object_positions, noise_index, env_id):
+    noise_index = int(noise_index.item() if isinstance(noise_index, torch.Tensor) else noise_index)
+    if torch.isnan(fixed_object_positions[noise_index]).any():
+        fixed_object_positions[noise_index] = get_object_positions(env)[env_id]
+    set_object_positions(env, fixed_object_positions[noise_index], env_id)
 
 
 def upper_half_range(value_range):
@@ -521,6 +565,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         'rand_noise_scale': args_cli.rand_noise_scale,
         'obs_receptive_noise_scale': args_cli.obs_receptive_noise_scale,
         'num_discrete_noises': args_cli.num_discrete_noises,
+        'fix_object_position_per_noise_index': args_cli.fix_object_position_per_noise_index,
         'dynamics_randomization_args': dynamics_randomization_arg_summary(args_cli),
     }
 
@@ -533,6 +578,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     GENERAL_NOISE_SCALES = torch.Tensor(cur_utils.GENERAL_NOISE_SCALES).to(device=args_cli.device)
     noise_rng = np.random.default_rng(agent_cfg.seed)
     continuous_noise = use_continuous_noise(args_cli.num_discrete_noises)
+    if args_cli.fix_object_position_per_noise_index and continuous_noise:
+        raise ValueError("--fix_object_position_per_noise_index requires positive --num_discrete_noises.")
     if continuous_noise:
         obsnoise = sample_randn((env.num_envs, 2), noise_rng, args_cli.device)
         actnoise = sample_randn((env.num_envs, 7), noise_rng, args_cli.device)
@@ -540,6 +587,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     else:
         obsnoise_scenarios = sample_randn((args_cli.num_discrete_noises, 2), noise_rng, args_cli.device)
         actnoise_scenarios = sample_randn((args_cli.num_discrete_noises, 7), noise_rng, args_cli.device)
+        fixed_object_positions = None
+        if args_cli.fix_object_position_per_noise_index:
+            fixed_object_positions = torch.full(
+                (args_cli.num_discrete_noises, 14), torch.nan, device=env.unwrapped.device
+            )
         noise_schedule = make_balanced_noise_schedule(
             args_cli.num_discrete_noises, args_cli.num_trajectories, noise_rng, args_cli.device
         )
@@ -547,6 +599,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         noise_index = noise_schedule[torch.arange(env.num_envs, device=args_cli.device) % len(noise_schedule)]
         obsnoise = obsnoise_scenarios[noise_index]
         actnoise = actnoise_scenarios[noise_index]
+        if args_cli.fix_object_position_per_noise_index:
+            for i in range(env.num_envs):
+                set_fixed_object_position_for_noise(env.unwrapped, fixed_object_positions, noise_index[i], i)
+            obs = env.get_observations()
     
     # simulate environment
     while simulation_app.is_running() and len(completed_recordings) < args_cli.num_trajectories:
@@ -588,6 +644,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                         next_noise_schedule_index += 1
                         obsnoise[i] = obsnoise_scenarios[noise_index[i]]
                         actnoise[i] = actnoise_scenarios[noise_index[i]]
+                        if args_cli.fix_object_position_per_noise_index:
+                            set_fixed_object_position_for_noise(env.unwrapped, fixed_object_positions, noise_index[i], i)
+
+            if args_cli.fix_object_position_per_noise_index and dones.any().item():
+                obs = env.get_observations()
 
             collected_count = min(len(completed_recordings), args_cli.num_trajectories)
             if collected_count >= last_saved_count + save_interval or collected_count == args_cli.num_trajectories:

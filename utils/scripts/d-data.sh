@@ -1,7 +1,7 @@
 #!/bin/bash -l
 #SBATCH --job-name=data        # Job name
-#SBATCH --output=collected_data/data_apr27_a2r2o0015ninf_upperfriction_1/log/%j_%x_out.txt        # Output file (%j = job ID)
-#SBATCH --error=collected_data/data_apr27_a2r2o0015ninf_upperfriction_1/log/%j_%x_err.txt         # Error file
+#SBATCH --output=collected_data/data_may5_r4n2k_per50_1/log/%j_%x_out.txt        # Output file (%j = job ID)
+#SBATCH --error=collected_data/data_may5_r4n2k_per50_1/log/%j_%x_err.txt         # Error file
 #SBATCH --time=24:00:00            # Time limit (hh:mm:ss)
 #SBATCH --nodes=1                  # Number of nodes
 #SBATCH --ntasks=1                 # Number of tasks (MPI ranks)
@@ -53,17 +53,18 @@ HYDRA_FULL_ERROR=1 /isaac-sim/python.sh scripts/reinforcement_learning/rsl_rl/pl
     env.scene.insertive_object=peg \
     env.scene.receptive_object=peghole \
     --headless \
-    --record_path collected_data/data_may2_r3n1_2/trajectories.pkl \
+    --record_path collected_data/data_may5_r4n2k_per50_1/trajectories.pkl \
     --num_trajectories 100000 \
     --horizon 60 \
     --act_noise_scale 0.0 \
-    --rand_noise_scale 3.0 \
+    --rand_noise_scale 4.0 \
     --obs_receptive_noise_scale 0.0 \
-    --num_discrete_noises 1 \
+    --num_discrete_noises 2000 \
     --seed 42 \
     --insertive-object-static-friction-range 1.0 2.0 \
     --insertive-object-dynamic-friction-range 0.9 1.9 \
     --receptive-object-static-friction-range 0.2 0.6 \
     --receptive-object-dynamic-friction-range 0.15 0.5 \
+    --fix_object_position_per_noise_index \
 
 '
