@@ -87,6 +87,12 @@ class MLP(nn.Module):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data", type=str, default="collected_data/data_may4_a2r2o002n500_per100_1/trajectories.pkl")
+    parser.add_argument(
+        "--test-data",
+        type=str,
+        default=None,
+        help="Optional held-out dataset. When set, all of --data is split into train/val and this dataset is used as test.",
+    )
     parser.add_argument("--train-noise-fraction", type=float, default=0.8)
     parser.add_argument("--val-fraction", type=float, default=0.1)
     parser.add_argument("--trajectories-per-noise", type=int, default=100)
@@ -113,6 +119,12 @@ def parse_args() -> argparse.Namespace:
             "How to choose prior transitions: nearest by current policy+action input, "
             "nearest by current policy state only, random prior transition, or zeroed memory."
         ),
+    )
+    parser.add_argument(
+        "--retrieval-action-multiplier",
+        type=float,
+        default=1.0,
+        help="Multiplier applied to normalized action dimensions for state_action retrieval distances.",
     )
     parser.add_argument("--retrieval-batch-size", type=int, default=8192)
     parser.add_argument("--retrieval-initial-k", type=int, default=64)
@@ -536,6 +548,16 @@ def retrieval_key_values(data: TransitionData, retrieval_mode: str) -> torch.Ten
     raise ValueError(f"Unsupported retrieval mode: {retrieval_mode}")
 
 
+def apply_retrieval_action_multiplier(keys: np.ndarray, policy_dim: int, multiplier: float) -> None:
+    if multiplier < 0.0:
+        raise ValueError("--retrieval-action-multiplier must be non-negative.")
+    if multiplier == 1.0:
+        return
+    if not 0 <= policy_dim < keys.shape[1]:
+        raise ValueError(f"Invalid policy_dim={policy_dim} for retrieval keys with dim={keys.shape[1]}.")
+    keys[:, policy_dim:] *= multiplier
+
+
 def materialize_split(
     data: TransitionData,
     indices: np.ndarray,
@@ -756,9 +778,25 @@ def main() -> None:
     if filter_stats.num_kept_trajectories == 0:
         raise ValueError("No trajectories remain after filtering.")
 
-    train_noise_ids, test_noise_ids = split_noise_ids(all_noise_ids, args.train_noise_fraction, args.seed)
-    train_full = build_transitions(filtered_groups, train_noise_ids, expected_horizon)
-    test_full = build_transitions(filtered_groups, test_noise_ids, expected_horizon)
+    if args.test_data is None:
+        train_noise_ids, test_noise_ids = split_noise_ids(all_noise_ids, args.train_noise_fraction, args.seed)
+        test_filter_stats = None
+        train_full = build_transitions(filtered_groups, train_noise_ids, expected_horizon)
+        test_full = build_transitions(filtered_groups, test_noise_ids, expected_horizon)
+    else:
+        train_noise_ids = all_noise_ids
+        test_trajectories = load_trajectories(args.test_data)
+        test_groups = group_by_noise(test_trajectories, args.trajectories_per_noise)
+        test_noise_ids = sorted(test_groups)
+        test_filtered_groups, test_filter_stats = filter_groups(
+            test_groups,
+            args.min_trajectory_length,
+            args.max_action_magnitude,
+        )
+        if test_filter_stats.num_kept_trajectories == 0:
+            raise ValueError("No test trajectories remain after filtering.")
+        train_full = build_transitions(filtered_groups, train_noise_ids, expected_horizon)
+        test_full = build_transitions(test_filtered_groups, test_noise_ids, expected_horizon)
     if train_full.policy_dim != test_full.policy_dim:
         raise ValueError(f"Mismatched train/test policy dims: {train_full.policy_dim} != {test_full.policy_dim}")
 
@@ -783,6 +821,9 @@ def main() -> None:
         key_mean, key_std = compute_normalization(train_key_values[torch.from_numpy(train_indices)])
         train_keys = normalized_numpy(train_key_values, key_mean, key_std, args.normalization_batch_size)
         test_keys = normalized_numpy(test_key_values, key_mean, key_std, args.normalization_batch_size)
+        if args.retrieval_mode == "state_action":
+            apply_retrieval_action_multiplier(train_keys, train_full.policy_dim, args.retrieval_action_multiplier)
+            apply_retrieval_action_multiplier(test_keys, test_full.policy_dim, args.retrieval_action_multiplier)
     retrieval_rng = np.random.default_rng(args.seed) if args.retrieval_mode == "random" else None
 
     nearest_train = previous_retrieval_indices(
@@ -852,6 +893,17 @@ def main() -> None:
         "dataset/train_no_prior_transitions": int(np.sum(nearest_train < 0)),
         "dataset/test_no_prior_transitions": int(np.sum(nearest_test < 0)),
     }
+    if test_filter_stats is not None:
+        dataset_metrics.update(
+            {
+                "dataset/test_data_noise_indices": len(test_noise_ids),
+                "dataset/test_data_trajectories": test_filter_stats.num_total_trajectories,
+                "dataset/test_data_kept_trajectories": test_filter_stats.num_kept_trajectories,
+                "dataset/test_data_removed_trajectories": test_filter_stats.num_removed_trajectories,
+                "dataset/test_data_short_trajectories": test_filter_stats.num_short_trajectories,
+                "dataset/test_data_large_action_trajectories": test_filter_stats.num_large_action_trajectories,
+            }
+        )
     wandb.init(
         project=args.wandb_project,
         name=args.wandb_run_name,
