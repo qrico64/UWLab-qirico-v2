@@ -39,6 +39,9 @@ class SplitData:
     targets: torch.Tensor
     noise_ids: np.ndarray
     trajectory_in_noise: np.ndarray
+    base_input_dim: int
+    num_retrieved_transitions: int
+    retrieval_mode: str
 
     @property
     def num_transitions(self) -> int:
@@ -129,6 +132,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--retrieval-batch-size", type=int, default=8192)
     parser.add_argument("--retrieval-initial-k", type=int, default=64)
     parser.add_argument("--retrieval-max-query-elements", type=int, default=5_000_000)
+    parser.add_argument(
+        "--num-retrieved-transitions",
+        type=int,
+        default=1,
+        help="Number of prior transitions to retrieve per input; set to 0 to disable memory.",
+    )
     parser.add_argument("--retrieval-num-workers", type=int, default=-1)
     parser.add_argument("--retrieval-log-every", type=int, default=25)
     parser.add_argument("--normalization-batch-size", type=int, default=200_000)
@@ -376,6 +385,7 @@ def query_ckdtree(tree, points: np.ndarray, k: int, num_workers: int):
 
 def nearest_previous_ckdtree_group(
     keys: np.ndarray,
+    num_retrieved: int,
     batch_size: int,
     initial_k: int,
     max_query_elements: int,
@@ -387,14 +397,14 @@ def nearest_previous_ckdtree_group(
         raise ImportError("SciPy is required for --retrieval-backend ckdtree.") from exc
 
     num_points = keys.shape[0]
-    nearest = np.full(num_points, -1, dtype=np.int64)
-    if num_points < 2:
+    nearest = np.full((num_points, num_retrieved), -1, dtype=np.int64)
+    if num_retrieved == 0 or num_points <= num_retrieved:
         return nearest
 
     keys = np.ascontiguousarray(keys, dtype=np.float32)
     tree = cKDTree(keys)
-    unresolved = np.arange(1, num_points, dtype=np.int64)
-    k = min(num_points, max(2, initial_k))
+    unresolved = np.arange(num_retrieved, num_points, dtype=np.int64)
+    k = min(num_points, max(num_retrieved + 1, initial_k))
 
     while unresolved.size:
         next_unresolved = []
@@ -408,29 +418,29 @@ def nearest_previous_ckdtree_group(
             candidates = candidates.astype(np.int64, copy=False)
 
             before = candidates < query_ids[:, None]
-            has_previous = before.any(axis=1)
+            has_previous = before.sum(axis=1) >= num_retrieved
             if has_previous.any():
                 rows = np.flatnonzero(has_previous)
-                first_previous = before[rows].argmax(axis=1)
-                nearest[query_ids[rows]] = candidates[rows, first_previous]
+                for row in rows:
+                    nearest[query_ids[row]] = candidates[row, before[row]][:num_retrieved]
             if not has_previous.all():
                 next_unresolved.append(query_ids[~has_previous])
 
         if not next_unresolved:
             break
-        # Increase k until every query has seen its nearest prior transition.
+        # Increase k until every query has seen enough nearest prior transitions.
         if k == num_points:
-            raise RuntimeError("Failed to find a prior transition even after querying the whole group.")
+            raise RuntimeError("Failed to find enough prior transitions even after querying the whole group.")
         unresolved = np.concatenate(next_unresolved, axis=0)
         k = min(num_points, k * 2)
 
     return nearest
 
 
-def nearest_previous_torch_group(keys: np.ndarray, batch_size: int) -> np.ndarray:
+def nearest_previous_torch_group(keys: np.ndarray, num_retrieved: int, batch_size: int) -> np.ndarray:
     num_points = keys.shape[0]
-    nearest = np.full(num_points, -1, dtype=np.int64)
-    if num_points < 2:
+    nearest = np.full((num_points, num_retrieved), -1, dtype=np.int64)
+    if num_retrieved == 0 or num_points <= num_retrieved:
         return nearest
     if batch_size < 1:
         raise ValueError("--retrieval-batch-size must be at least 1.")
@@ -438,28 +448,33 @@ def nearest_previous_torch_group(keys: np.ndarray, batch_size: int) -> np.ndarra
     keys_tensor = torch.from_numpy(np.ascontiguousarray(keys, dtype=np.float32))
     norms = keys_tensor.square().sum(dim=1)
     candidate_ids = torch.arange(num_points)
-    for start in range(1, num_points, batch_size):
+    for start in range(num_retrieved, num_points, batch_size):
         end = min(start + batch_size, num_points)
         query_ids = torch.arange(start, end)
         query = keys_tensor[start:end]
         distances = query.square().sum(dim=1, keepdim=True) + norms.unsqueeze(0) - 2.0 * query.matmul(keys_tensor.T)
         distances[candidate_ids.unsqueeze(0) >= query_ids.unsqueeze(1)] = torch.inf
-        nearest[start:end] = torch.argmin(distances, dim=1).numpy()
+        nearest[start:end] = torch.topk(distances, k=num_retrieved, largest=False, dim=1).indices.numpy()
     return nearest
 
 
-def random_previous_group(num_points: int, rng: np.random.Generator) -> np.ndarray:
-    previous = np.full(num_points, -1, dtype=np.int64)
-    if num_points < 2:
+def random_previous_group(num_points: int, num_retrieved: int, rng: np.random.Generator) -> np.ndarray:
+    previous = np.full((num_points, num_retrieved), -1, dtype=np.int64)
+    if num_retrieved == 0 or num_points <= num_retrieved:
         return previous
-    previous[1:] = (rng.random(num_points - 1) * np.arange(1, num_points, dtype=np.float64)).astype(np.int64)
+    for index in range(num_retrieved, num_points):
+        previous[index] = rng.choice(index, size=num_retrieved, replace=False)
     return previous
 
 
-def immediate_previous_group(num_points: int) -> np.ndarray:
-    previous = np.arange(num_points, dtype=np.int64) - 1
-    if num_points > 0:
-        previous[0] = -1
+def immediate_previous_group(num_points: int, num_retrieved: int) -> np.ndarray:
+    previous = np.full((num_points, num_retrieved), -1, dtype=np.int64)
+    for offset in range(num_retrieved):
+        previous[num_retrieved:, offset] = np.arange(
+            num_retrieved - offset - 1,
+            num_points - offset - 1,
+            dtype=np.int64,
+        )
     return previous
 
 
@@ -468,6 +483,7 @@ def previous_retrieval_indices(
     noise_ids: np.ndarray,
     order_in_noise: np.ndarray,
     retrieval_mode: str,
+    num_retrieved: int,
     backend: str,
     batch_size: int,
     initial_k: int,
@@ -478,6 +494,10 @@ def previous_retrieval_indices(
 ) -> np.ndarray:
     if retrieval_mode not in {"state_action", "policy", "random", "zero"}:
         raise ValueError(f"Unsupported retrieval mode: {retrieval_mode}")
+    if num_retrieved < 0:
+        raise ValueError("--num-retrieved-transitions must be non-negative.")
+    if num_retrieved == 0:
+        return np.empty((noise_ids.shape[0], 0), dtype=np.int64)
     if retrieval_keys is not None and retrieval_keys.shape[0] != noise_ids.shape[0]:
         raise ValueError(f"Mismatched retrieval keys/noise ids: {retrieval_keys.shape[0]} != {noise_ids.shape[0]}")
     if retrieval_mode in {"random", "zero"}:
@@ -497,7 +517,7 @@ def previous_retrieval_indices(
         resolved_backend = resolve_retrieval_backend(backend)
         num_transitions = retrieval_keys.shape[0]
 
-    nearest = np.full(num_transitions, -1, dtype=np.int64)
+    nearest = np.full((num_transitions, num_retrieved), -1, dtype=np.int64)
     unique_noise_ids = np.unique(noise_ids)
 
     # Memory is local to each noise id, so test noise ids use only their own past.
@@ -508,29 +528,31 @@ def previous_retrieval_indices(
             raise AssertionError(f"Non-contiguous order_in_noise for noise_index={noise_id}.")
 
         if retrieval_mode == "random":
-            local_nearest = random_previous_group(group.shape[0], rng)
+            local_nearest = random_previous_group(group.shape[0], num_retrieved, rng)
         elif retrieval_mode == "zero":
-            local_nearest = immediate_previous_group(group.shape[0])
+            local_nearest = immediate_previous_group(group.shape[0], num_retrieved)
         elif resolved_backend == "ckdtree":
             local_nearest = nearest_previous_ckdtree_group(
                 retrieval_keys[group],
+                num_retrieved,
                 batch_size,
                 initial_k,
                 max_query_elements,
                 num_workers,
             )
         elif resolved_backend == "torch":
-            local_nearest = nearest_previous_torch_group(retrieval_keys[group], batch_size)
+            local_nearest = nearest_previous_torch_group(retrieval_keys[group], num_retrieved, batch_size)
         else:
             raise ValueError(f"Unsupported retrieval backend: {resolved_backend}")
 
-        valid = local_nearest >= 0
+        valid = np.all(local_nearest >= 0, axis=1)
         nearest[group[valid]] = group[local_nearest[valid]]
         if log_every > 0 and (group_index % log_every == 0 or group_index == len(unique_noise_ids)):
             print(
                 "retrieval | "
                 f"mode={retrieval_mode} "
                 f"backend={resolved_backend} "
+                f"num_retrieved={num_retrieved} "
                 f"noise_groups={group_index}/{len(unique_noise_ids)} "
                 f"transitions={num_transitions}"
             )
@@ -558,34 +580,62 @@ def apply_retrieval_action_multiplier(keys: np.ndarray, policy_dim: int, multipl
     keys[:, policy_dim:] *= multiplier
 
 
+def valid_retrieval_indices(order_in_noise: np.ndarray, num_retrieved: int) -> np.ndarray:
+    if num_retrieved < 0:
+        raise ValueError("--num-retrieved-transitions must be non-negative.")
+    if num_retrieved == 0:
+        return np.arange(order_in_noise.shape[0], dtype=np.int64)
+    return np.flatnonzero(order_in_noise >= num_retrieved)
+
+
+def shuffle_retrieved_order(indices: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    if indices.shape[1] <= 1:
+        return indices
+    order = np.argsort(rng.random(indices.shape), axis=1)
+    return np.take_along_axis(indices, order, axis=1)
+
+
 def materialize_split(
     data: TransitionData,
     indices: np.ndarray,
     nearest_indices: np.ndarray,
     split_name: str,
     retrieval_mode: str,
+    order_rng: np.random.Generator,
 ) -> SplitData:
     nearest = nearest_indices[indices]
+    if nearest.ndim != 2:
+        raise ValueError(f"{split_name} nearest indices must be 2D, got shape {nearest.shape}.")
     if np.any(nearest < 0):
-        missing = int(np.sum(nearest < 0))
-        raise ValueError(f"{split_name} has {missing} transitions without a prior retrieved transition.")
+        missing = int(np.sum(np.any(nearest < 0, axis=1)))
+        raise ValueError(f"{split_name} has {missing} transitions without enough prior retrieved transitions.")
+    nearest = shuffle_retrieved_order(nearest, order_rng)
 
     query_indices = torch.from_numpy(indices.astype(np.int64, copy=False))
     base_dim = data.inputs.shape[1]
     target_dim = data.targets.shape[1]
-    inputs = torch.empty((indices.shape[0], base_dim * 2 + target_dim), dtype=torch.float32)
+    num_retrieved = nearest.shape[1]
+    retrieved_dim = base_dim + target_dim
+    inputs = torch.empty((indices.shape[0], base_dim + num_retrieved * retrieved_dim), dtype=torch.float32)
     inputs[:, :base_dim] = data.inputs[query_indices]
-    if retrieval_mode == "zero":
+    if num_retrieved == 0:
+        pass
+    elif retrieval_mode == "zero":
         inputs[:, base_dim:] = 0.0
     else:
-        retrieved_indices = torch.from_numpy(nearest.astype(np.int64, copy=False))
-        inputs[:, base_dim : 2 * base_dim] = data.inputs[retrieved_indices]
-        inputs[:, 2 * base_dim :] = data.targets[retrieved_indices]
+        retrieved_indices = torch.from_numpy(nearest.reshape(-1).astype(np.int64, copy=False))
+        retrieved_inputs = data.inputs[retrieved_indices].reshape(indices.shape[0], num_retrieved, base_dim)
+        retrieved_targets = data.targets[retrieved_indices].reshape(indices.shape[0], num_retrieved, target_dim)
+        retrieved_values = torch.cat([retrieved_inputs, retrieved_targets], dim=-1)
+        inputs[:, base_dim:] = retrieved_values.reshape(indices.shape[0], num_retrieved * retrieved_dim)
     return SplitData(
         inputs=inputs,
         targets=data.targets[query_indices],
         noise_ids=data.noise_ids[indices],
         trajectory_in_noise=data.trajectory_in_noise[indices],
+        base_input_dim=base_dim,
+        num_retrieved_transitions=num_retrieved,
+        retrieval_mode=retrieval_mode,
     )
 
 
@@ -647,6 +697,52 @@ def split_transition_losses(
     return np.concatenate(losses, axis=0)
 
 
+def split_retrieved_label_losses(
+    split: SplitData,
+    target_mean: torch.Tensor,
+    target_std: torch.Tensor,
+    device: torch.device,
+    batch_size: int,
+) -> np.ndarray:
+    if batch_size < 1:
+        raise ValueError("--batch-size must be at least 1.")
+    if split.num_retrieved_transitions < 1 and split.retrieval_mode != "zero":
+        raise ValueError("Retrieved-label baseline requires at least one retrieved transition.")
+
+    losses = []
+    target_dim = split.targets.shape[1]
+    retrieved_dim = split.base_input_dim + target_dim
+    with torch.no_grad():
+        for start in range(0, split.num_transitions, batch_size):
+            end = min(start + batch_size, split.num_transitions)
+            targets = split.targets[start:end].to(device, non_blocking=True)
+            target_normalized = (targets - target_mean) / target_std
+
+            if split.retrieval_mode == "zero":
+                preds = torch.zeros_like(target_normalized)
+            else:
+                inputs = split.inputs[start:end].to(device, non_blocking=True)
+                retrieved_values = inputs[:, split.base_input_dim :].reshape(
+                    end - start,
+                    split.num_retrieved_transitions,
+                    retrieved_dim,
+                )
+                retrieved_targets = retrieved_values[:, :, split.base_input_dim :]
+                retrieved_normalized = (retrieved_targets - target_mean) / target_std
+                if split.num_retrieved_transitions == 1:
+                    preds = retrieved_normalized[:, 0]
+                else:
+                    label_losses = (retrieved_normalized - target_normalized[:, None]).square().mean(dim=2)
+                    closest_labels = label_losses.argmin(dim=1)
+                    preds = retrieved_normalized[
+                        torch.arange(retrieved_normalized.shape[0], device=device),
+                        closest_labels,
+                    ]
+
+            losses.append((preds - target_normalized).square().mean(dim=1).cpu().numpy())
+    return np.concatenate(losses, axis=0)
+
+
 def trajectory_loss_curve(split: SplitData, losses: np.ndarray) -> dict[str, np.ndarray]:
     if losses.shape[0] != split.num_transitions:
         raise ValueError(f"Mismatched losses/transitions: {losses.shape[0]} != {split.num_transitions}")
@@ -684,9 +780,15 @@ def trajectory_loss_curve(split: SplitData, losses: np.ndarray) -> dict[str, np.
     }
 
 
-def save_trajectory_loss_curve(save_dir: Path, split_name: str, curve: dict[str, np.ndarray]) -> tuple[Path, Path]:
-    txt_path = save_dir / f"{split_name}_trajectory_loss.txt"
-    png_path = save_dir / f"{split_name}_trajectory_loss.png"
+def save_trajectory_loss_curve(
+    save_dir: Path,
+    split_name: str,
+    curve: dict[str, np.ndarray],
+    output_name: str = "trajectory_loss",
+    title_metric: str = "loss",
+) -> tuple[Path, Path]:
+    txt_path = save_dir / f"{split_name}_{output_name}.txt"
+    png_path = save_dir / f"{split_name}_{output_name}.png"
 
     with txt_path.open("w", encoding="utf-8") as f:
         f.write("trajectory_in_noise\tmean_loss_across_noise_indices\tnum_noise_indices\tnum_transitions\n")
@@ -707,7 +809,7 @@ def save_trajectory_loss_curve(save_dir: Path, split_name: str, curve: dict[str,
     ax.plot(curve["trajectory_in_noise"], curve["mean_loss"], marker="o", markersize=3, linewidth=1.5)
     ax.set_xlabel("Trajectory number within noise index")
     ax.set_ylabel("Mean normalized MSE")
-    ax.set_title(f"{split_name.capitalize()} loss by trajectory number")
+    ax.set_title(f"{split_name.capitalize()} {title_metric} by trajectory number")
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     fig.savefig(png_path, dpi=200)
@@ -746,6 +848,38 @@ def save_all_trajectory_loss_outputs(
     return output_paths
 
 
+def save_all_retrieved_label_trajectory_loss_outputs(
+    save_path: str,
+    splits: dict[str, SplitData],
+    target_mean: torch.Tensor,
+    target_std: torch.Tensor,
+    device: torch.device,
+    batch_size: int,
+) -> dict[str, tuple[Path, Path]]:
+    save_dir = Path(save_path)
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    output_paths = {}
+    for split_name, split in splits.items():
+        if split.retrieval_mode == "zero" or split.num_retrieved_transitions > 0:
+            retrieved_label_losses = split_retrieved_label_losses(
+                split,
+                target_mean,
+                target_std,
+                device,
+                batch_size,
+            )
+            retrieved_label_curve = trajectory_loss_curve(split, retrieved_label_losses)
+            output_paths[split_name] = save_trajectory_loss_curve(
+                save_dir,
+                split_name,
+                retrieved_label_curve,
+                output_name="retrieved_label_trajectory_loss",
+                title_metric="retrieved-label baseline loss",
+            )
+    return output_paths
+
+
 def make_loader(split: SplitData, batch_size: int, shuffle: bool, num_workers: int) -> DataLoader:
     return DataLoader(
         TensorDataset(split.inputs, split.targets),
@@ -761,6 +895,8 @@ def main() -> None:
     args = parse_args()
     hidden_dims = parse_hidden_dims(args.hidden_dims)
     expected_horizon = args.expected_horizon if args.expected_horizon > 0 else None
+    if args.num_retrieved_transitions < 0:
+        raise ValueError("--num-retrieved-transitions must be non-negative.")
 
     set_seed(args.seed)
     device = torch.device(args.device)
@@ -800,8 +936,8 @@ def main() -> None:
     if train_full.policy_dim != test_full.policy_dim:
         raise ValueError(f"Mismatched train/test policy dims: {train_full.policy_dim} != {test_full.policy_dim}")
 
-    valid_train_indices = np.flatnonzero(train_full.order_in_noise > 0)
-    valid_test_indices = np.flatnonzero(test_full.order_in_noise > 0)
+    valid_train_indices = valid_retrieval_indices(train_full.order_in_noise, args.num_retrieved_transitions)
+    valid_test_indices = valid_retrieval_indices(test_full.order_in_noise, args.num_retrieved_transitions)
     train_indices, val_indices = split_train_val_indices(
         valid_train_indices,
         args.val_fraction,
@@ -810,8 +946,14 @@ def main() -> None:
     if valid_test_indices.shape[0] == 0:
         raise ValueError("No valid test transitions remain after dropping transitions with no prior memory.")
 
-    train_key_values = retrieval_key_values(train_full, args.retrieval_mode)
-    test_key_values = retrieval_key_values(test_full, args.retrieval_mode)
+    if args.num_retrieved_transitions == 0:
+        train_key_values = None
+        test_key_values = None
+        train_keys = None
+        test_keys = None
+    else:
+        train_key_values = retrieval_key_values(train_full, args.retrieval_mode)
+        test_key_values = retrieval_key_values(test_full, args.retrieval_mode)
     if train_key_values is None:
         train_keys = None
         test_keys = None
@@ -831,6 +973,7 @@ def main() -> None:
         train_full.noise_ids,
         train_full.order_in_noise,
         args.retrieval_mode,
+        args.num_retrieved_transitions,
         args.retrieval_backend,
         args.retrieval_batch_size,
         args.retrieval_initial_k,
@@ -844,6 +987,7 @@ def main() -> None:
         test_full.noise_ids,
         test_full.order_in_noise,
         args.retrieval_mode,
+        args.num_retrieved_transitions,
         args.retrieval_backend,
         args.retrieval_batch_size,
         args.retrieval_initial_k,
@@ -854,12 +998,27 @@ def main() -> None:
     )
     del train_keys, test_keys, train_key_values, test_key_values
 
-    train = materialize_split(train_full, train_indices, nearest_train, "train", args.retrieval_mode)
-    val = materialize_split(train_full, val_indices, nearest_train, "val", args.retrieval_mode)
-    test = materialize_split(test_full, valid_test_indices, nearest_test, "test", args.retrieval_mode)
+    retrieval_order_rng = np.random.default_rng(args.seed + 2)
+    train = materialize_split(train_full, train_indices, nearest_train, "train", args.retrieval_mode, retrieval_order_rng)
+    val = materialize_split(train_full, val_indices, nearest_train, "val", args.retrieval_mode, retrieval_order_rng)
+    test = materialize_split(test_full, valid_test_indices, nearest_test, "test", args.retrieval_mode, retrieval_order_rng)
+    splits = {"train": train, "val": val, "test": test}
 
     input_mean, input_std = compute_normalization(train.inputs)
     target_mean, target_std = compute_normalization(train.targets)
+    input_mean = input_mean.to(device)
+    input_std = input_std.to(device)
+    target_mean = target_mean.to(device)
+    target_std = target_std.to(device)
+
+    retrieved_label_loss_paths = save_all_retrieved_label_trajectory_loss_outputs(
+        args.save_path,
+        splits,
+        target_mean,
+        target_std,
+        device,
+        args.batch_size,
+    )
 
     train_loader = make_loader(train, args.batch_size, True, args.num_workers)
     train_eval_loader = make_loader(train, args.batch_size, False, args.num_workers)
@@ -869,10 +1028,6 @@ def main() -> None:
     model = MLP(train.inputs.shape[1], train.targets.shape[1], hidden_dims, args.dropout).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     loss_fn = nn.MSELoss()
-    input_mean = input_mean.to(device)
-    input_std = input_std.to(device)
-    target_mean = target_mean.to(device)
-    target_std = target_std.to(device)
 
     dataset_metrics = {
         "dataset/noise_indices": len(all_noise_ids),
@@ -890,8 +1045,8 @@ def main() -> None:
         "dataset/train_transitions": train.num_transitions,
         "dataset/val_transitions": val.num_transitions,
         "dataset/test_transitions": test.num_transitions,
-        "dataset/train_no_prior_transitions": int(np.sum(nearest_train < 0)),
-        "dataset/test_no_prior_transitions": int(np.sum(nearest_test < 0)),
+        "dataset/train_no_prior_transitions": int(np.sum(np.any(nearest_train < 0, axis=1))),
+        "dataset/test_no_prior_transitions": int(np.sum(np.any(nearest_test < 0, axis=1))),
     }
     if test_filter_stats is not None:
         dataset_metrics.update(
@@ -911,11 +1066,13 @@ def main() -> None:
         config={
             **vars(args),
             "base_input_dim": train_full.inputs.shape[1],
-            "retrieved_dim": train_full.inputs.shape[1] + train_full.targets.shape[1],
+            "retrieved_dim": args.num_retrieved_transitions * (train_full.inputs.shape[1] + train_full.targets.shape[1]),
             "input_dim": train.inputs.shape[1],
             "output_dim": train.targets.shape[1],
             "resolved_retrieval_backend": (
-                "none" if args.retrieval_mode in {"random", "zero"} else resolve_retrieval_backend(args.retrieval_backend)
+                "none"
+                if args.num_retrieved_transitions == 0 or args.retrieval_mode in {"random", "zero"}
+                else resolve_retrieval_backend(args.retrieval_backend)
             ),
             **dataset_metrics,
         },
@@ -928,6 +1085,10 @@ def main() -> None:
         f"kept_trajectories={filter_stats.num_kept_trajectories}/{filter_stats.num_total_trajectories} "
         f"train={train.num_transitions} val={val.num_transitions} test={test.num_transitions}"
     )
+    for split_name, (png_path, txt_path) in retrieved_label_loss_paths.items():
+        wandb.summary[f"retrieved_label_trajectory_loss/{split_name}_plot"] = str(png_path)
+        wandb.summary[f"retrieved_label_trajectory_loss/{split_name}_data"] = str(txt_path)
+        print(f"retrieved-label trajectory loss curve | split={split_name} plot={png_path} data={txt_path}")
 
     best_val_loss = float("inf")
     for epoch in range(1, args.epochs + 1):
@@ -983,7 +1144,7 @@ def main() -> None:
     trajectory_loss_paths = save_all_trajectory_loss_outputs(
         args.save_path,
         model,
-        {"train": train, "val": val, "test": test},
+        splits,
         input_mean,
         input_std,
         target_mean,

@@ -225,7 +225,8 @@ def main() -> None:
             y_values = [point[1] for point in sorted_points]
 
         label = f"{plot_labels[0]} - {plot_labels[1]}"
-        ax.plot(x_values[:10], y_values[:10], marker=marker, linewidth=1.8, markersize=3, label=label)
+        cutoff = len(x_values) // 10 * 10
+        ax.plot(x_values[:cutoff], y_values[:cutoff], marker=marker, linewidth=1.8, markersize=3, label=label)
     else:
         for index, (_loss_file, x_values, y_values) in enumerate(xy_values):
             if args.sort_x:
@@ -234,7 +235,8 @@ def main() -> None:
                 y_values = [point[1] for point in sorted_points]
 
             label = plot_labels[index]
-            ax.plot(x_values[:10], y_values[:10], marker=marker, linewidth=1.8, markersize=3, label=label)
+            cutoff = len(x_values) // 10 * 10
+            ax.plot(x_values[:cutoff], y_values[:cutoff], marker=marker, linewidth=1.8, markersize=3, label=label)
 
     ax.set_xlabel(args.x_key)
     ax.set_ylabel(f"{args.y_key} difference" if args.difference else args.y_key)
